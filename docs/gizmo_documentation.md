@@ -4252,6 +4252,12 @@ Newer versions of the code include a wide range of additional flags in the heade
     UnitLength_In_CGS = user-specified unit length in cgs (from parameterfile)
     Internal_UnitB_In_Gauss = internal code B-units (not what is in the snapshot, but useful to check if desired setup is actually done, if MAGNETIC on) 
     UnitMagneticField_In_Gauss = unit of the MagneticField dataset in Gauss, i.e. UnitMagneticField_in_gauss from the parameterfile (B[Gauss] = MagneticField * UnitMagneticField_In_Gauss; if MAGNETIC on)
+    Compile_Config_Options = the Config.sh options the code was compiled with, one per line (as printed at the top of stdout)
+    Compile_Effective_Options = every compile-time option in effect, one per line as NAME or NAME=value: the Config.sh options plus every default and derived option they switch on
+    Compile_Effective_Options_FNV1a64 = 64-bit hash of Compile_Effective_Options (equal for builds with the same effective options)
+    Build_Info = host, user, branch and commit of the build (the commit is followed by -tracked-dirty if tracked source files had uncommitted changes)
+    Compiler_Version = the compiler that built the code
+    Executable_FNV1a64, Executable_Size_In_Bytes = 64-bit hash and size of the executable that wrote the file (to check whether two runs used the same build; an identity check, not a security hash)
     Gravitational_Constant_In_Code_Inits = gravity constant G in code units
     
     Minimum_Mass_For_Cell_Merge = minimum mass below which cells are merged

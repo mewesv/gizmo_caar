@@ -23,6 +23,12 @@ void write_header_attributes_in_hdf5(hid_t handle);
 void read_header_attributes_in_hdf5(char *fname);
 
 void output_compile_time_options(void);
+const char *compile_time_config_literal(void);              /* the Config.sh lines, one per line */
+const char *compile_time_effective_options(void);           /* every option defined in the build, NAME or NAME=value, one per line */
+unsigned long long compile_time_effective_options_fnv1a64(void);
+const char *compile_time_compiler_version(void);
+unsigned long long executable_fnv1a64(void);
+long long executable_size_in_bytes(void);
 
 void report_pinning(void);
 void pin_to_core_set(void);
