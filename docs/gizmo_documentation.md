@@ -4723,7 +4723,7 @@ GIZMO includes a **pytest-based test suite** that automates building, running, a
 
 **Step 1: Install GIZMO as a Python package.** From the GIZMO source directory, run `pip install .` (or `pip install -e .` for an editable/development install). This installs the `gizmo` Python package, which includes test utilities and snapshot-reading tools. Dependencies include `pytest`, `h5py`, `numpy`, `scipy`, `matplotlib`, `astropy`, and `meshoid`.
 
-**Step 2: Ensure your build environment works.** Make sure `Makefile.systype` has the correct system type uncommented for your machine (e.g. `SYSTYPE=MacBookCellar` for a typical macOS homebrew setup).
+**Step 2: Ensure your build environment works.** Make sure `Makefile.systype` has the correct system type uncommented for your machine (e.g. `SYSTYPE=MacBookCellar` for a typical macOS homebrew setup). The tests launch GIZMO with `mpirun` (adding Open MPI's placement flags only when `mpirun` is Open MPI). If your system requires a different launcher, set the environment variable `GIZMO_TEST_MPI_LAUNCHER` to it, with `{ranks}` and `{threads}` for the rank and thread counts, e.g. `GIZMO_TEST_MPI_LAUNCHER="srun --ntasks={ranks} --cpus-per-task={threads}"` or `GIZMO_TEST_MPI_LAUNCHER=ibrun`.
 
 **Step 3: Run tests.** From the GIZMO source directory:
 
