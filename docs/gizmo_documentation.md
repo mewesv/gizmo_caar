@@ -175,6 +175,10 @@
     + [How do I Avoid Memory Errors/Crashes?](#faqs-memory)
     + [My Large Simulation Hangs, but Smaller Runs Work?](#faqs-big)
     + [Why Did Everything Drop to TimeBin=1?](#faqs-timebin)
+    + [A Parameter I Set Has No Effect?](#faqs-ignoredparams)
+    + [How do I Stop a Run Cleanly?](#faqs-stop)
+    + [Why Do Two Identical Runs Not Give Bit-for-Bit Identical Results?](#faqs-reproducibility)
+    + [Why Are Conserved Quantities Not Always Conserved to Machine Precision with Individual Timesteps?](#faqs-conservation)
     + [Are there Public ICs? Analysis Tools? Image/Movie-Makers?](#faqs-rscr)
     + [What Does this Variable Mean?](#faqs-variable)
     + [What are the Code Units?](#faqs-units)
@@ -5721,7 +5725,7 @@ Good luck!
 <a name="faqs-startup"></a>
 ## My Run Won't Start, What Did I Do Wrong?
 
-Again, this is not something with a generic answer. If your run will not start, its almost never a code problem, but a setup problem. Common causes include: (1) code was compiled incorrectly, (2) cant find the libraries it needs, (3) memory settings (see below) are incorrect and ask for more memory than available, (4) the source code, parameterfile, other needed files (ICs, TREECOOL, etc) are not in the correct directories your run script thinks they should be in, (5) your run script was not written correctly for the machine you are running on, (6) your maximum/minimum timesteps are set much too high or low for the problem, (7) your end time or begin time of the run, or box size, or cosmological parameters are set incorrectly, (8) the initial conditions file is not in the correct format, or has data not in the format assumed (remember parameters like `INPUT_IN_DOUBLEPRECISION`, etc. are needed for those inputs to be read correctly if they are in those formats), (9) your settings (e.g. node number or multipledomains, or force softenings and smoothing length limits) are set such that the code spends its entire run-time in the 'overhead' calculations (reading in ICs, initial iteration to converge to smoothing lengths, etc). 
+Again, this is not something with a generic answer. If your run will not start, its almost never a code problem, but a setup problem. Common causes include: (1) code was compiled incorrectly, (2) cant find the libraries it needs, (3) memory settings (see below) are incorrect and ask for more memory than available, (4) the source code, parameterfile, other needed files (ICs, TREECOOL, etc) are not in the correct directories your run script thinks they should be in, (5) your run script was not written correctly for the machine you are running on, (6) your maximum/minimum timesteps are set much too high or low for the problem, (7) your end time or begin time of the run, or box size, or cosmological parameters are set incorrectly, (8) the initial conditions file is not in the correct format, or has data not in the format assumed (remember parameters like `INPUT_IN_DOUBLEPRECISION`, etc. are needed for those inputs to be read correctly if they are in those formats), (9) your settings (e.g. node number or multipledomains, or force softenings and smoothing length limits) are set such that the code spends its entire run-time in the 'overhead' calculations (reading in ICs, initial iteration to converge to smoothing lengths, etc). (10) the parameterfile is given by a long path: its name is limited to 255 characters, and a longer one stops the run at once with the message `The parameterfile name '...' is N characters long, but at most 255 are allowed.` Keep the parameterfile in the directory you run from and pass just its name (e.g. `mpirun -np 64 ./GIZMO params.txt`). 
 
 Always check all stdout and stderr and run-time output files (including outputs from the job script system if they include those). If no such outputs exist the problem is almost certainly in your job submission script. If outputs exist, search for the error codes. Outputs in stdout with error codes will be error codes in GIZMO -- search for them explicitly in the GIZMO source code (do a grep) to find out where the code exited if the description is unclear. Other error codes are machine or compiler-provided: a simple search online will usually find a more useful description. 
 
@@ -5761,6 +5765,28 @@ Look carefully at the stdout, and profiling info, to diagnose in which subroutin
 
 In my experience, this is usually caused by users setting inappropriate flags (flags not designed for the problem they are simulating, or mutually-incompatible flags), or having a units mistake in their ICs or parameter file (so the timesteps are wildly different from what the user 'thinks' they should be), or reading ICs with insufficient precision (so particles have identical positions at floating-point accuracy, solved by setting the input and output `Config.sh` flags to `DOUBLEPRECISION`). But obviously, if you think you've identified a bug, you should go to the user group and report it.
 
+<a name="faqs-ignoredparams"></a>
+## A Parameter I Set Has No Effect?
+
+Check the stdout for a line like `Tag 'X' was specified, but it is being ignored`. The code reads only the parameters that the compiled modules use: a parameter belonging to a module (or a `DEVELOPER_MODE` option) that is not enabled in `Config.sh`, or a misspelled name, is skipped with exactly this warning, and the run proceeds with the default. If a parameter appears twice in the parameterfile, the **first** occurrence is used and the second is reported as ignored. The file `parameters-usedvalues` in the output directory lists every value the run actually used: check it whenever you are varying a parameter between runs.
+
+<a name="faqs-stop"></a>
+## How do I Stop a Run Cleanly?
+
+Create an empty file named `stop` in the run's output directory (`touch output/stop`): at the end of the current timestep the code writes restart files and exits normally, so the run can be continued later (see [Restarting a run](#tutorial-restart)). To bound a run from the start, set `MaxSimulationWallTime_in_Seconds` in the parameterfile: the code stops in the same way once 85% of that wall-clock time has elapsed, leaving margin to write the restart files before a queue limit kills the job. Killing the job instead loses everything since the last restart file, and can leave files half-written.
+
+<a name="faqs-reproducibility"></a>
+## Why Do Two Identical Runs Not Give Bit-for-Bit Identical Results?
+
+Floating-point addition is not associative, so any change in the order of operations changes the last bits of a result: different numbers of MPI tasks or OpenMP threads, different domain decompositions, GPU versus CPU execution, and even the scheduling of threads from one run to the next all change the order in which neighbor or tree contributions are summed. Iterative steps (e.g. the kernel-length iteration, which stops anywhere within its tolerance) and any chaotic dynamics (turbulence, star formation, N-body interactions) then amplify those last-bit differences until individual elements differ visibly, while the statistical properties of the simulation agree. So compare runs statistically, or against known solutions, not element by element. This does not explain large differences that appear immediately (at the first steps) between runs with the same number of tasks and threads: chaotic amplification takes time to grow, so such differences should be investigated. (Note also that restart files, unlike snapshots, can only be used with the same executable and the same number of MPI tasks that wrote them.)
+
+<a name="faqs-conservation"></a>
+## Why Are Conserved Quantities Not Always Conserved to Machine Precision with Individual Timesteps?
+
+With adaptive (individual) timesteps, neighboring elements are generally advanced on different steps, and each applies its exchanges with its neighbors over its own timestep. Conserved quantities (momentum, energy, metal and other passive-scalar masses, magnetic flux, photon and cosmic-ray number, and so on) are then conserved to the accuracy of the time integration, not to machine precision: this exchange error converges away as the timesteps shrink, and vanishes when all elements share one timestep. This is an intentional and valid choice of method, not a fallback or a known deficiency: a deliberate trade of manifest conservation for lower memory and computational cost, made by essentially every astrophysics code that uses adaptive timesteps. The one quantity for which **GIZMO** enforces machine-accurate conservation with extra machinery is total mass (in the MFV method, where mass moves between cells), because some physics breaks badly if mass is not exactly conserved. For most problems the other errors are far below the uncertainties in the physics (yields, mixing rates, chemistry); in problems where they are not, the error can be reduced with smaller timesteps.
+
+When a global total changes in your run, separate three possibilities: (1) real sources, sinks or boundary fluxes (star formation, feedback injection, cooling losses, open boundaries, particles removed), which change it physically; (2) the adaptive-timestep exchange error described here, which shrinks with smaller timesteps and disappears if all elements are forced onto one timestep; and (3) a genuine problem, which does neither. Repeating the problem with smaller timesteps, and optionally with one shared timestep, is a useful diagnostic: the integration error should decrease systematically as the timesteps shrink. Its disappearing on a shared timestep alone does not prove that the adaptive-timestep behavior is correct.
+
 <a name="faqs-rscr"></a>
 ## Are there Public ICs? Analysis Tools? Image/Movie-Makers?
 
@@ -5776,7 +5802,7 @@ Example: if you are using radiation-hydrodynamics, and see the variable `PhotonE
 <a name="faqs-units"></a>
 ## What are the Code Units?
 
-See the section of this User Guide on [Units](#snaps-units). If you aren't sure whether something is in one unit or another (e.g. is this an absolute energy associated with a particle, or a specific energy, or an energy density?) check the units for sanity, and search for the variable in the source code to see where it is defined and written out.
+See the section of this User Guide on [Units](#snaps-units). Magnetic fields in snapshots are in units of the parameterfile's `UnitMagneticField_in_gauss`, recorded in the snapshot header as `UnitMagneticField_In_Gauss` (multiply by it to get Gauss). If you aren't sure whether something is in one unit or another (e.g. is this an absolute energy associated with a particle, or a specific energy, or an energy density?) check the units for sanity, and search for the variable in the source code to see where it is defined and written out.
 
 <a name="faqs-citation"></a>
 ## Can I use this Module? What should I cite?
