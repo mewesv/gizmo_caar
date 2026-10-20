@@ -1126,7 +1126,7 @@
 #ifndef RT_SPEEDOFLIGHT_REDUCTION
 #define RT_SPEEDOFLIGHT_REDUCTION (1.0)
 #endif
-#ifndef RT_SOURCES
+#if (defined(RADTRANSFER) || defined(RT_USE_GRAVTREE) || defined(RT_SOURCE_INJECTION)) && !defined(RT_SOURCES) /* only radiation code reads the source types */
 #define RT_SOURCES 1+2+4+8+16+32 // default to allowing all types to act as sources //
 #endif
 
