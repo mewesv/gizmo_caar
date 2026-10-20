@@ -1,5 +1,6 @@
 #![our mascot](gizmo_documentation_ims/gizmo_smaller.png) GIZMO Users Guide 
 ***
+<a name="toc"></a>
 #Table of Contents
 1. [Code Overview](#codeoverview)
     + [Code Philosophy & Design](#codeoverview-philosophy)
@@ -5829,3 +5830,79 @@ Use this code at your own risk! It is provided without any guarantees of support
 Best of luck, enjoy!
 
 - Phil
+
+
+<!-- Navigation for the HTML version of this guide: a sidebar built from the Table of Contents (the list after the "toc" anchor at the top), highlighting the current section, plus a back-to-top button. It has no effect on the Markdown text, and does nothing where scripts are not run (e.g. viewing this file on GitHub). Keep it free of blank lines (so Markdown converters pass it through unchanged) and of double equals signs (which Marked 2 can turn into highlight marks, even here). -->
+<style>
+nav#gizmo-nav { position: fixed; top: 0; left: 0; bottom: 0; width: 300px; box-sizing: border-box; overflow-y: auto; padding: 12px 10px 40px 10px; background: #f6f7f9; border-right: 1px solid #d8dbe0; font: 13px/1.35 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; z-index: 1000; }
+nav#gizmo-nav .gizmo-nav-title { display: block; font-weight: 700; font-size: 15px; margin: 2px 4px 10px 4px; color: #1f2328; text-decoration: none; }
+nav#gizmo-nav ol, nav#gizmo-nav ul { margin: 0; padding-left: 1.2em; }
+nav#gizmo-nav li { margin: 1px 0; }
+nav#gizmo-nav li > ul { display: none; }
+nav#gizmo-nav li.gizmo-open > ul { display: block; }
+nav#gizmo-nav a { color: #1f2328; text-decoration: none; display: block; padding: 2px 5px; border-radius: 4px; }
+nav#gizmo-nav a:hover { background: #e4e8ee; }
+nav#gizmo-nav a.gizmo-current { background: #d6e4f7; font-weight: 600; }
+nav#gizmo-nav a:focus-visible, button#gizmo-nav-toggle:focus-visible, button#gizmo-top:focus-visible { outline: 2px solid #2f6fd0; outline-offset: 1px; }
+body.gizmo-has-nav { margin-left: 320px !important; }
+button#gizmo-nav-toggle, button#gizmo-top { position: fixed; z-index: 1001; border: 1px solid #c4c9d0; background: #ffffff; color: #1f2328; border-radius: 6px; padding: 6px 10px; font: 13px -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+button#gizmo-nav-toggle { top: 10px; left: 10px; display: none; }
+button#gizmo-top { bottom: 16px; right: 16px; display: none; }
+@media (max-width: 1100px) {
+html { scroll-padding-top: 52px; }
+nav#gizmo-nav { display: none; width: 85vw; max-width: 340px; padding-top: 52px; box-shadow: 2px 0 12px rgba(0,0,0,0.2); }
+nav#gizmo-nav.gizmo-shown { display: block; }
+body.gizmo-has-nav { margin-left: auto !important; padding-top: 44px !important; }
+button#gizmo-nav-toggle { display: block; }
+}
+@media print {
+nav#gizmo-nav, button#gizmo-nav-toggle, button#gizmo-top { display: none !important; }
+body.gizmo-has-nav { margin-left: 0 !important; padding-top: 0 !important; }
+}
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var marker = document.getElementsByName("toc")[0] || document.getElementById("toc");
+  if (!marker) { return; }
+  var lists = document.querySelectorAll("ol, ul"), toc = null;
+  for (var k = 0; k < lists.length && !toc; k++) {
+    if (marker.compareDocumentPosition(lists[k]) & Node.DOCUMENT_POSITION_FOLLOWING) { toc = lists[k]; }
+  }
+  if (!toc) { return; }
+  var nav = document.createElement("nav"); nav.id = "gizmo-nav"; nav.setAttribute("aria-label", "User guide contents");
+  var title = document.createElement("a"); title.className = "gizmo-nav-title"; title.href = "#"; title.textContent = "GIZMO User Guide";
+  nav.appendChild(title); nav.appendChild(toc.cloneNode(true)); document.body.appendChild(nav);
+  document.body.classList.add("gizmo-has-nav");
+  var toggle = document.createElement("button"); toggle.id = "gizmo-nav-toggle"; toggle.type = "button"; toggle.textContent = "☰ Contents";
+  toggle.setAttribute("aria-controls", "gizmo-nav"); toggle.setAttribute("aria-expanded", "false"); document.body.appendChild(toggle);
+  function show_nav(shown) { nav.classList.toggle("gizmo-shown", shown); toggle.setAttribute("aria-expanded", shown ? "true" : "false"); }
+  toggle.addEventListener("click", function () { show_nav(!nav.classList.contains("gizmo-shown")); });
+  document.addEventListener("keydown", function (e) { switch (e.key) { case "Escape": case "Esc": if (nav.classList.contains("gizmo-shown")) { show_nav(false); toggle.focus(); } } });
+  var top = document.createElement("button"); top.id = "gizmo-top"; top.type = "button"; top.textContent = "↑ Top"; document.body.appendChild(top);
+  top.addEventListener("click", function () { window.scrollTo(0, 0); });
+  var links = [], all = nav.querySelectorAll("a[href^='#']");
+  for (var i = 0; i < all.length; i++) {
+    var id = decodeURIComponent(all[i].getAttribute("href").slice(1)); if (!id) { continue; }
+    var target = document.getElementById(id) || document.getElementsByName(id)[0];
+    if (target) { links.push({ link: all[i], target: target }); }
+    all[i].addEventListener("click", function () { show_nav(false); });
+  }
+  var current = null, pending = false;
+  function update() {
+    pending = false;
+    top.style.display = (window.scrollY > 600) ? "block" : "none";
+    var found = null;
+    for (var j = 0; j < links.length; j++) { if (links[j].target.getBoundingClientRect().top <= 90) { found = links[j]; } else { break; } }
+    if (Object.is(found, current)) { return; }
+    var opened = nav.querySelectorAll(".gizmo-current, .gizmo-open");
+    for (var m = 0; m < opened.length; m++) { opened[m].classList.remove("gizmo-current"); opened[m].classList.remove("gizmo-open"); opened[m].removeAttribute("aria-current"); }
+    current = found; if (!found) { return; }
+    found.link.classList.add("gizmo-current"); found.link.setAttribute("aria-current", "location");
+    for (var p = found.link.parentNode; p && !Object.is(p, nav); p = p.parentNode) { if (/^LI$/.test(p.tagName)) { p.classList.add("gizmo-open"); } }
+    var r = found.link.getBoundingClientRect(), n = nav.getBoundingClientRect();
+    if (r.top < n.top + 40 || r.bottom > n.bottom - 40) { nav.scrollTop += r.top - n.top - n.height / 3; }
+  }
+  window.addEventListener("scroll", function () { if (!pending) { pending = true; window.requestAnimationFrame(update); } });
+  update();
+});
+</script>
