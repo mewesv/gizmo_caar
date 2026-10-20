@@ -12,7 +12,7 @@ If you are not working in an environment that works with the default build envir
 
 ## Step 2b: if your machine does not launch MPI jobs with Open MPI's `mpirun`
 
-The tests launch GIZMO with `mpirun`. With Open MPI they add its placement flags; with any other `mpirun` (Intel MPI, MPICH) they pass only `-np`. On systems that require their own launcher, set `GIZMO_TEST_MPI_LAUNCHER` to the launcher command, with `{ranks}` and `{threads}` standing for the rank and thread counts of each run, e.g. `export GIZMO_TEST_MPI_LAUNCHER="srun --ntasks={ranks} --cpus-per-task={threads}"`, or `export GIZMO_TEST_MPI_LAUNCHER=ibrun`. The executable and its arguments are appended to it.
+The tests launch GIZMO with `mpirun`. With Open MPI they add its placement flags; with any other `mpirun` (Intel MPI, MPICH) they pass only `-np`. On systems that require their own launcher, set `GIZMO_TEST_MPI_LAUNCHER` to the launcher command, with `{ranks}` and `{threads}` standing for the rank and thread counts of each run, e.g. `export GIZMO_TEST_MPI_LAUNCHER="srun --ntasks={ranks} --cpus-per-task={threads}"`, or `export GIZMO_TEST_MPI_LAUNCHER="ibrun -n {ranks}"`. The executable and its arguments are appended to it.
 
 ## Step 3: run pytest
 
