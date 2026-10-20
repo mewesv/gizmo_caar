@@ -1,7 +1,7 @@
-#![our mascot](gizmo_documentation_ims/gizmo_smaller.png) GIZMO Users Guide 
+#![newlogofromshivan](gizmo_documentation_ims/gizmo_newlogo.jpeg) GIZMO Users Guide 
 ***
 <a name="toc"></a>
-#Table of Contents
+##![our mascot](gizmo_documentation_ims/gizmo_smaller.png) Table of Contents
 1. [Code Overview](#codeoverview)
     + [Code Philosophy & Design](#codeoverview-philosophy)
 2. [Feature Set (Types of Physics Modules)](#features)
