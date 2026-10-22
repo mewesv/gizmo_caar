@@ -62,7 +62,14 @@ compiler=${KOKKOS_BUILD_CXX:-$default_compiler}
 jobs=${KOKKOS_BUILD_JOBS:-8}
 if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then printf 'KOKKOS_BUILD_JOBS must be positive\n' >&2; exit 2; fi
 command -v "$cmake" >/dev/null || { printf 'CMake executable not found: %s\n' "$cmake" >&2; exit 2; }
-compiler=$(command -v "$compiler") || { printf 'Compiler executable not found: %s\n' "$compiler" >&2; exit 2; }
+if ! resolved_compiler=$(command -v "$compiler"); then
+    printf 'Compiler executable not found: %s\n' "$compiler" >&2
+    if [[ "$backend" == hip ]]; then
+        printf 'Load the ROCm toolchain (on Frontier: module load rocm), or set KOKKOS_BUILD_CXX to the compiler executable path.\n' >&2
+    fi
+    exit 2
+fi
+compiler=$resolved_compiler
 build_dir=${KOKKOS_BUILD_DIR:-$root/build/kokkos/$profile}
 prefix=${KOKKOS_INSTALL_PREFIX:-$root/install/kokkos/$profile}
 # These paths are consumed by the legacy Makefile, which has no general path

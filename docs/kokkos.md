@@ -94,6 +94,58 @@ existing profile's name and generated GIZMO flags.
 
 ## Select the installation in GIZMO
 
+### Frontier build wrapper
+
+After installing Kokkos, use the wrapper to load Frontier's modules, select
+`SYSTYPE=Frontier`, and pass the installation to GIZMO:
+
+```sh
+./scripts/build_gizmo.sh frontier
+```
+
+The defaults are `src/Config.sh`, eight build jobs, and
+`install/kokkos/hip-mi250-release` under this checkout. An exported
+`KOKKOS_PREFIX` or `KOKKOS_INSTALL_PREFIX` overrides that default installation.
+Explicit paths are also supported (relative paths are relative to your shell):
+
+```sh
+./scripts/build_gizmo.sh frontier --config test/my_problem/Config.sh \
+  --kokkos-prefix /path/to/kokkos/install -j 8
+```
+
+To use the existing site Kokkos module instead:
+
+```sh
+./scripts/build_gizmo.sh frontier --kokkos-module
+```
+
+The wrapper loads `PrgEnv-amd`, `amd/6.4.2`, `rocm/6.4.2`, `cray-mpich/9.0.1`,
+`craype-accel-amd-gfx90a`, `cray-hdf5`, `cray-fftw`, and `gsl`, matching the
+existing Frontier Makefile. It loads `hypre/3.0.0-mpi` only when the physics
+config requires HYPRE and neither `HYPRE_ROOT` nor `HYPRE_DIR` selects a custom
+installation. Custom HYPRE selections unload the site HYPRE module. Private
+Kokkos selections unload the site Kokkos module. The wrapper does not reset
+unrelated modules. Module load failures stop the script.
+
+Module versions can be changed explicitly with `GIZMO_FRONTIER_ROCM_VERSION`
+(selects both AMD and ROCm), `GIZMO_FRONTIER_MPICH_VERSION`,
+`GIZMO_FRONTIER_KOKKOS_MODULE`, and `GIZMO_FRONTIER_HYPRE_MODULE`; select a
+mutually compatible stack and Kokkos installation. Job count can also be set
+with `GIZMO_BUILD_JOBS`.
+
+The wrapper checks the config, HIP Kokkos headers/libraries, compilers, and site
+paths before running Make. It cleans first by default because the legacy build
+does not track changes in compiler flags. Use `--no-clean` only for incremental
+builds with the same toolchain, Kokkos installation and physics config. Builds
+still share `src/` object files; do not run different configurations concurrently
+in one checkout. The wrapper does not build Kokkos or modify `Makefile.systype`.
+
+Module changes are local to the script. Load the same modules in your batch job
+and set `HSA_XNACK=1` for this managed-memory GPU build. This wrapper has not yet
+been validated on Frontier.
+
+### Direct Make invocation
+
 Choose the matching machine in `src/Makefile.systype` and supply your simulation's
 `src/Config.sh`. Then, from the repository root:
 
