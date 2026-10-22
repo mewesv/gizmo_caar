@@ -96,16 +96,30 @@ existing profile's name and generated GIZMO flags.
 
 ### Frontier build wrapper
 
-After installing Kokkos, use the wrapper to load Frontier's modules, select
-`SYSTYPE=Frontier`, and pass the installation to GIZMO:
+Load your compiler/library environment first, then use the wrapper to select
+`SYSTYPE=Frontier` and pass the Kokkos installation to GIZMO:
 
 ```sh
+source /path/to/modules.sh
 ./scripts/build_gizmo.sh frontier
 ```
 
-The defaults are `src/Config.sh`, eight build jobs, and
-`install/kokkos/hip-mi250-release` under this checkout. An exported
-`KOKKOS_PREFIX` or `KOKKOS_INSTALL_PREFIX` overrides that default installation.
+The defaults are `src/Config.sh`, eight build jobs (override the latter with
+`GIZMO_BUILD_JOBS` or `-j`), and the pinned submodule's installation at
+`install/kokkos/hip-mi250-release` under this checkout. Build that installation
+first using `./scripts/build_kokkos.sh hip-mi250-release`.
+
+Another Kokkos installation requires an explicit override:
+
+1. Explicit `--kokkos-prefix PATH`.
+2. Exported `KOKKOS_PREFIX`.
+
+Without either override, the wrapper uses the pinned submodule's default
+installation and fails if it is missing. It does not search other installations.
+`OLCF_KOKKOS_ROOT` does not override the default. `KOKKOS_INSTALL_PREFIX` sets the
+dependency helper's install location only; to select a custom location for
+GIZMO, pass `--kokkos-prefix` or export `KOKKOS_PREFIX` explicitly.
+
 Explicit paths are also supported (relative paths are relative to your shell):
 
 ```sh
@@ -113,25 +127,13 @@ Explicit paths are also supported (relative paths are relative to your shell):
   --kokkos-prefix /path/to/kokkos/install -j 8
 ```
 
-To use the existing site Kokkos module instead:
-
-```sh
-./scripts/build_gizmo.sh frontier --kokkos-module
-```
-
-The wrapper loads `PrgEnv-amd`, `amd/6.4.2`, `rocm/6.4.2`, `cray-mpich/9.0.1`,
-`craype-accel-amd-gfx90a`, `cray-hdf5`, `cray-fftw`, and `gsl`, matching the
-existing Frontier Makefile. It loads `hypre/3.0.0-mpi` only when the physics
-config requires HYPRE and neither `HYPRE_ROOT` nor `HYPRE_DIR` selects a custom
-installation. Custom HYPRE selections unload the site HYPRE module. Private
-Kokkos selections unload the site Kokkos module. The wrapper does not reset
-unrelated modules. Module load failures stop the script.
-
-Module versions can be changed explicitly with `GIZMO_FRONTIER_ROCM_VERSION`
-(selects both AMD and ROCm), `GIZMO_FRONTIER_MPICH_VERSION`,
-`GIZMO_FRONTIER_KOKKOS_MODULE`, and `GIZMO_FRONTIER_HYPRE_MODULE`; select a
-mutually compatible stack and Kokkos installation. Job count can also be set
-with `GIZMO_BUILD_JOBS`.
+Environment setup is separate from building. The wrapper does not load or
+unload modules, initialize a module command, or discover/source `modules.sh` in
+any directory. Your setup file can live wherever you prefer and can export the
+Kokkos prefix alongside other dependency paths. Use a compiler/ROCm/MPI stack
+compatible with the selected Kokkos installation; the existing Frontier
+Makefile documents its expected stack. Optional physics libraries such as
+HYPRE must also be provided by your environment when enabled in `Config.sh`.
 
 The wrapper checks the config, HIP Kokkos headers/libraries, compilers, and site
 paths before running Make. It cleans first by default because the legacy build
@@ -140,9 +142,8 @@ builds with the same toolchain, Kokkos installation and physics config. Builds
 still share `src/` object files; do not run different configurations concurrently
 in one checkout. The wrapper does not build Kokkos or modify `Makefile.systype`.
 
-Module changes are local to the script. Load the same modules in your batch job
-and set `HSA_XNACK=1` for this managed-memory GPU build. This wrapper has not yet
-been validated on Frontier.
+Use the same environment setup in your batch job and set `HSA_XNACK=1` for this
+managed-memory GPU build. This wrapper has not yet been validated on Frontier.
 
 ### Direct Make invocation
 
