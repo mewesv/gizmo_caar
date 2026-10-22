@@ -83,6 +83,53 @@ control flow: it closes on block exit, early return, and exception unwinding.
 Scope objects cannot be copied or moved and must be destroyed on their creating
 thread. Do not manually stop a scope owned by a `TimerScope` object.
 
+## Find finer-grained costs
+
+Start with `timers.txt` and find an expensive region with a large **self** time.
+Add smaller scopes around distinct work inside that region, rebuild GIZMO, and
+rerun the same workload. For example, inside the already-instrumented
+`gravity_tree()` function in `src/gravity/gravtree.cc`, add blocks like:
+
+```cpp
+{
+    GIZMO_TIMER_SCOPE("PrepareWalk");
+    // existing preparation work
+}
+{
+    GIZMO_TIMER_SCOPE("EvaluateWalk");
+    // existing walk work
+}
+{
+    GIZMO_TIMER_SCOPE("ExchangeResults");
+    // existing communication work
+}
+```
+
+Each timer lasts until the end of its block. These names are automatically
+reported under the active path, for example
+`Step::Tree::TreeSolve::EvaluateWalk`. No enum, registration table or report
+format needs to be edited. Add another nested block to investigate a child.
+Wrapping a function call includes all synchronous work in that call.
+
+For explicit boundaries, `TimerStart("PrepareWalk")` and
+`TimerStop("PrepareWalk")` measure only the statements between them. Scope timers
+are preferable when the region has early exits. Start with batches or phases to
+keep instrumentation overhead small. Device function bodies need GPU profiling;
+host scope timers belong outside the kernel, around its dispatch.
+
+For an investigation, report at every step boundary:
+
+```sh
+GIZMO_TIMERS=1 GIZMO_TIMERS_INTERVAL=1 \
+  mpiexec -n 4 ./src/GIZMO parameters.txt
+```
+
+Reports remain cumulative. For a selected interval, subtract two snapshots' times
+and call counts within the same session. Increase the reporting interval again
+for large production runs. The TSV `path` column allows filtering a subtree;
+`inclusive_mean_s`, `inclusive_max_s`, and `exclusive_mean_s` distinguish a
+region's overall cost, rank imbalance, and time not attributed to its children.
+
 ## Read the measurements
 
 - **Inclusive:** elapsed time in a region, including its nested regions.

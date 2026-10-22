@@ -81,6 +81,7 @@ __pycache__/
 
 # Build directory
 build/
+/install/
 
 # Claude Code per-session state (auto-memory, transcripts, etc.)
 .claude/

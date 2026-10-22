@@ -872,7 +872,7 @@ INCL    += 	declarations/allvars.h \
 			structure/fof.h \
 			structure/subfind/subfind.h \
 			cooling/cooling.h \
-			Makefile
+			Makefile ../config/kokkos/installed.mk
 
 
 ## now we add special cases dependent on compiler flags. normally we would
@@ -930,6 +930,9 @@ GRACKLEINCL =
 GRACKLELIBS =
 endif
 
+
+# Optional installation override, after machine defaults and before flags expand.
+include ../config/kokkos/installed.mk
 
 # linking libraries (includes machine-dependent options above)
 CFLAGS = $(OPTIONS) $(FFTW_INCL) $(HDF5INCL) \
