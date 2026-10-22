@@ -9,6 +9,7 @@
 #include "../declarations/allvars.h"
 #include "../declarations/multifluid_helpers.h"
 #include "../core/proto.h"
+#include "../system/timer.h"
 #include "gpu_gravtree.h"
 #include "gpu_gravity_tree.h"   /* gpu_gravity_tree_mark_born_current */
 #include "../mesh/gpu_neighbor_list.h"   /* the touched set's lifecycle counters, reported below */
@@ -135,6 +136,7 @@ void refresh_old_acceleration_for_tree_opening(void)
 
 void gravity_tree(void)
 {
+    GIZMO_TIMER_SCOPE("TreeSolve");
     /* initialize variables */
     long long n_exported = 0; int i, j, maxnumnodes, iter; i = 0; j = 0; iter = 0; maxnumnodes=0;
     double t0, t1, timeall = 0, timetree1 = 0, timetree2 = 0, timetree, timewait, timecomm;
