@@ -58,6 +58,13 @@ case "$prefix" in *[!a-zA-Z0-9_./+-]*) fail 'Kokkos prefix contains whitespace o
     fail "Missing Kokkos headers in $prefix/include; select the install directory, not source/build"
 awk '$1 == "#define" && $2 == "KOKKOS_ENABLE_HIP" {found=1} END {exit !found}' \
     "$prefix/include/KokkosCore_config.h" || fail 'Frontier GPU builds require a HIP-enabled Kokkos installation'
+metadata="$prefix/share/gizmo/kokkos.mk"
+if [[ -f $metadata ]] && awk '
+    $1 == "GIZMO_KOKKOS_DEVICE_FLAGS" && index($0, ":xnack+") {enabled=1}
+    END {exit !enabled}
+' "$metadata"; then
+    fail 'Selected Kokkos still targets XNACK-on; rebuild Kokkos in fresh build/install directories for the XNACK-off Frontier profile'
+fi
 compgen -G "$prefix/lib/libkokkoscore.*" >/dev/null || \
     compgen -G "$prefix/lib64/libkokkoscore.*" >/dev/null || fail "Kokkos core library missing from $prefix"
 for tool in cc CC hipcc make perl; do
@@ -77,4 +84,4 @@ if [[ $clean == 1 ]]; then
     make -C "$root/src" "${make_options[@]}" clean
 fi
 make -C "$root/src" -j"$jobs" "${make_options[@]}"
-printf '\nBuilt: %s/src/GIZMO\nRuntime: use the same toolchain environment and export HSA_XNACK=1 in your job script.\n' "$root"
+printf '\nBuilt: %s/src/GIZMO\nRuntime: use the same toolchain environment. The Frontier HIP profile targets XNACK-disabled execution.\n' "$root"
