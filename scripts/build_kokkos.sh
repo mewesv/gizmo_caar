@@ -12,7 +12,7 @@ Profiles:
   openmp-release       OpenMP CPU release build
   cuda-a100-release    CUDA, NVIDIA A100 (sm_80)
   cuda-h100-release    CUDA, NVIDIA H100 (sm_90)
-  hip-mi250-release    HIP, AMD MI250 (gfx90a:xnack+), Zen 3 host
+  hip-mi250-release    HIP, AMD MI250 (gfx90a:xnack-), Zen 3 host
 
 Environment overrides:
   CMAKE                 CMake executable (default: cmake)
@@ -49,7 +49,7 @@ case "$profile" in
     hip-mi250-release)
         backend=hip; default_compiler=hipcc
         expected_arch=KOKKOS_ARCH_VEGA90A
-        device_flags='--offload-arch=gfx90a:xnack+ -march=znver3' ;;
+        device_flags='--offload-arch=gfx90a:xnack- -march=znver3' ;;
     *) printf 'Unknown Kokkos profile: %s\n' "$profile" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -97,7 +97,10 @@ fi
 compiler_version=$("$compiler" --version)
 compiler_id=${compiler_version%%$'\n'*}
 options=$(printf '%q ' "$@")
-identity="$actual|$profile|$compiler|$compiler_id|$prefix|$options"
+# Cache initializers do not overwrite values in an existing CMake cache.
+# Include their contents so changing a profile cannot reuse stale device flags.
+profile_checksum=$(cksum "$root/config/kokkos/$profile.cmake" "$root/config/kokkos/common.cmake")
+identity="$actual|$profile|$profile_checksum|$device_flags|$compiler|$compiler_id|$prefix|$options"
 if [[ -f "$prefix/share/gizmo/build-identity.txt" ]] &&
    [[ $(cat "$prefix/share/gizmo/build-identity.txt") != "$identity" ]]; then
     printf 'Install identity changed. Select a fresh KOKKOS_INSTALL_PREFIX.\n' >&2
@@ -137,6 +140,7 @@ printf '%s\n' "$identity" > "$prefix/share/gizmo/build-identity.txt"
 } > "$prefix/share/gizmo/kokkos.mk"
 {
     printf 'profile=%s\nsource_commit=%s\ncompiler=%s\n' "$profile" "$actual" "$compiler"
+    printf 'device_flags=%s\nprofile_checksum=%s\n' "$device_flags" "$profile_checksum"
     printf 'configure_command='; printf '%q ' "$cmake" -S "$source_dir" -B "$build_dir" \
         -C "$root/config/kokkos/$profile.cmake" "-DCMAKE_CXX_COMPILER=$compiler" \
         "-DCMAKE_INSTALL_PREFIX=$prefix" "$@"; printf '\n'

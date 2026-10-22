@@ -36,7 +36,7 @@ the branch's C++17 toolchains and enable the Kokkos Tools loading interface.
 | `openmp-release` | OpenMP | CPU performance work |
 | `cuda-a100-release` | CUDA, AMPERE80 | NVIDIA A100 |
 | `cuda-h100-release` | CUDA, HOPPER90 | NVIDIA H100 |
-| `hip-mi250-release` | HIP, VEGA90A + ZEN3 | AMD MI250 with XNACK support |
+| `hip-mi250-release` | HIP, VEGA90A + ZEN3 | AMD MI250 with XNACK disabled |
 
 Run from the repository root, after loading the required toolchain:
 
@@ -64,9 +64,29 @@ NVCC_WRAPPER_DEFAULT_COMPILER=mpicxx \
 ```
 
 On Frontier, load the matching AMD/ROCm toolchain before building the HIP
-profile. The profile requests `gfx90a:xnack+`; runs using managed memory also
-require `HSA_XNACK=1` in their runtime environment. GPU profiles must be validated
-on their target machines.
+profile. The profile requests `gfx90a:xnack-`, matching the Frontier GIZMO
+machine block. Run with XNACK disabled (`HSA_XNACK=0`); the build scripts do not
+set that runtime variable. GPU profiles must be validated on their target
+machines. XNACK-off disables automatic GPU page-fault-driven migration: managed
+allocations can be accessed through mapped host memory, while ordinary host
+allocations need explicit registration or another device-accessible allocation
+strategy before GPU use. This mode has not yet been validated for GIZMO's full
+managed-memory access paths on Frontier.
+
+When switching an existing XNACK-on build to XNACK-off, use fresh dependency
+build/install directories and rebuild GIZMO completely. For example, to retain
+the old installation:
+
+```sh
+KOKKOS_BUILD_DIR="$PWD/build/kokkos/hip-mi250-xnack-off" \
+KOKKOS_INSTALL_PREFIX="$PWD/install/kokkos/hip-mi250-xnack-off" \
+  ./scripts/build_kokkos.sh hip-mi250-release
+./scripts/build_gizmo.sh frontier \
+  --kokkos-prefix "$PWD/install/kokkos/hip-mi250-xnack-off"
+```
+
+Use new directory names if these already contain an earlier build. The wrapper
+cleans GIZMO by default; do not use `--no-clean` for this transition.
 
 The script accepts these environment overrides:
 
@@ -86,7 +106,8 @@ KOKKOS_BUILD_JOBS=4 ./scripts/build_kokkos.sh serial-debug -- \
 ```
 
 Use fresh build/install directories when changing the source pin, compiler,
-profile, or configure options. The helper records an identity and refuses to
+profile contents, or configure options. The helper records an identity,
+including checksums of the profile and common cache settings, and refuses to
 reuse its directories with a different identity. It also checks the checkout
 against the recorded gitlink and rejects tracked source changes. Architecture
 and backend changes should have their own profile rather than contradict an
@@ -142,8 +163,8 @@ builds with the same toolchain, Kokkos installation and physics config. Builds
 still share `src/` object files; do not run different configurations concurrently
 in one checkout. The wrapper does not build Kokkos or modify `Makefile.systype`.
 
-Use the same environment setup in your batch job and set `HSA_XNACK=1` for this
-managed-memory GPU build. This wrapper has not yet been validated on Frontier.
+Use the same environment setup in your batch job and set `HSA_XNACK=0` for this
+XNACK-off GPU build. This wrapper has not yet been validated on Frontier.
 
 ### Direct Make invocation
 
