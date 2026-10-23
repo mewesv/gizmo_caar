@@ -52,6 +52,7 @@
  *
  * Written by Phil Hopkins (phopkins@caltech.edu) for GIZMO.
  */
+#include "../system/timer.h"
 
 #include <mpi.h>
 #include <stdio.h>
@@ -182,6 +183,7 @@ static void precompute_free_(precomputed_t& pre);   /* defined just below */
  * On allocation failure frees the whole pool and leaves capacity invalid (0). */
 static int precompute_ensure_(int N)
 {
+    GIZMO_TIMER_FUNCTION();
     if(pre_cap_ >= N) {return 0;}        /* capacity already sufficient: reuse */
     precompute_free_(pre_persist_);      /* drop the smaller pool before growing */
 #if defined(RT_USE_GRAVTREE) || defined(SINK_PHOTONMOMENTUM) || defined(COSMIC_RAY_SUBGRID_LEBRON)
@@ -215,6 +217,7 @@ static int precompute_ensure_(int N)
  * unchanged (source sparsification is a separate, profiling-gated change). */
 static void precompute_fill_(int N)
 {
+    GIZMO_TIMER_FUNCTION();
 #if defined(RT_USE_GRAVTREE) || defined(SINK_PHOTONMOMENTUM) || defined(COSMIC_RAY_SUBGRID_LEBRON)
     precomputed_t& pre = pre_persist_;
 #ifdef RT_USE_GRAVTREE
@@ -295,6 +298,7 @@ static int  fmirror_cap_     = 0;   /* current capacity in particles */
 
 static int *father_mirror_ensure_(int N)
 {
+    GIZMO_TIMER_FUNCTION();
     if(fmirror_cap_ < N) {
         if(fmirror_persist_) {Kokkos::kokkos_free<GIZMO_KOKKOS_SHARED_SPACE>(fmirror_persist_); fmirror_persist_ = NULL;}
         fmirror_persist_ = (int *) mr_alloc<GIZMO_KOKKOS_SHARED_SPACE>("treescratch_moment_fmirror", (long)N * sizeof(int));
@@ -786,6 +790,7 @@ static void mr_pending_init_launch_(Kokkos::View<int*, MrMemSpace, MrUnmanaged> 
 /* =================================================================== */
 extern "C" int gpu_moment_refresh(int active_root_node)
 {
+    GIZMO_TIMER_FUNCTION();
     (void) active_root_node; /* reserved hook, currently unused */
     if(Numnodestree <= 0) {return 0;}
     /* Defensive idempotent sync of AllDevice before any device-side All.* read. */
@@ -831,185 +836,191 @@ extern "C" int gpu_moment_refresh(int active_root_node)
     unsigned int *bitflags_soa = soa->bitflags;
     Vec3<MyFloat> *center_soa  = soa->center;
 
-    /* ---------------- Kernel 1: zero scratch + pending ----------------- */
-    /* pending is initialized to 1 (resident-thread slot); Kernel 2 adds
-     * one more for each internal-node child.  In Kernel 4 each thread
-     * claims its starting node with atomic_fetch_sub; only the last to
-     * arrive (prev==1) proceeds upward.  The +1 prevents the race where
-     * a late resident thread and the bottom-up walk both see pending==0
-     * and double-count the node. */
-    Kokkos::deep_copy(scr.pending, 1);
-    Kokkos::parallel_for("mr_zero_payloads", n, KOKKOS_LAMBDA(int k) {
-        mr_zero_payloads_(scr, k, bitflags_soa[k]);
-    });
+    {
+        GIZMO_TIMER_SCOPE("refresh_moments_kernels");
+        /* ---------------- Kernel 1: zero scratch + pending ----------------- */
+        /* pending is initialized to 1 (resident-thread slot); Kernel 2 adds
+         * one more for each internal-node child.  In Kernel 4 each thread
+         * claims its starting node with atomic_fetch_sub; only the last to
+         * arrive (prev==1) proceeds upward.  The +1 prevents the race where
+         * a late resident thread and the bottom-up walk both see pending==0
+         * and double-count the node. */
+        Kokkos::deep_copy(scr.pending, 1);
+        Kokkos::parallel_for("mr_zero_payloads", n, KOKKOS_LAMBDA(int k) {
+            mr_zero_payloads_(scr, k, bitflags_soa[k]);
+        });
 
-    /* ---------------- Kernel 2: pending counter init ------------------- */
-    mr_pending_init_launch_(scr.pending, father_soa, tree_base, n,
-                             tree_base, tree_base + n);
+        /* ---------------- Kernel 2: pending counter init ------------------- */
+        mr_pending_init_launch_(scr.pending, father_soa, tree_base, n,
+                                 tree_base, tree_base + n);
 
-    /* ---------------- Kernel 3: particle pass -------------------------- */
-    double maxKR = All.MaxKernelRadius;
+        /* ---------------- Kernel 3: particle pass -------------------------- */
+        double maxKR = All.MaxKernelRadius;
 #ifdef SINK_PHOTONMOMENTUM
-    MyFloat       *bh_lum_   = pre_persist_.bh_lum;
-    Vec3<MyFloat> *bh_angle_ = pre_persist_.bh_angle;
+        MyFloat       *bh_lum_   = pre_persist_.bh_lum;
+        Vec3<MyFloat> *bh_angle_ = pre_persist_.bh_angle;
 #endif
 #ifdef RT_USE_GRAVTREE
-    MyFloat *src_lum_ = pre_persist_.src_lum;
+        MyFloat *src_lum_ = pre_persist_.src_lum;
 #ifdef CHIMES_STELLAR_FLUXES
-    double  *src_lum_G0_  = pre_persist_.src_lum_G0;
-    double  *src_lum_ion_ = pre_persist_.src_lum_ion;
+        double  *src_lum_G0_  = pre_persist_.src_lum_G0;
+        double  *src_lum_ion_ = pre_persist_.src_lum_ion;
 #endif
 #endif
 #ifdef COSMIC_RAY_SUBGRID_LEBRON
-    MyFloat *cr_inj_ = pre_persist_.cr_inject;
+        MyFloat *cr_inj_ = pre_persist_.cr_inject;
 #endif
-    Kokkos::parallel_for("mr_part_accum", N, KOKKOS_LAMBDA(int i) {
-        int f = fmirror[i];
-        if(f < tree_base || f >= tree_base + n) {return;}
-        int k = f - tree_base;
-        const struct particle_data *pa = &P_dev[i];
+        Kokkos::parallel_for("mr_part_accum", N, KOKKOS_LAMBDA(int i) {
+            int f = fmirror[i];
+            if(f < tree_base || f >= tree_base + n) {return;}
+            int k = f - tree_base;
+            const struct particle_data *pa = &P_dev[i];
 
-        /* Load this leaf's fields + per-particle precomputes into the shared kernel's POD (native
-         * double; weighted products are formed at double precision inside the helper).  The gates and
-         * formulas live in moment_source_from_particle. */
-        moment_particle_src<MyGravFloat> ps = {};
-        ps.mass = pa->Mass;
-        for(int kk = 0; kk < 3; kk++) {ps.pos[kk] = pa->Pos[kk]; ps.vel[kk] = pa->Vel[kk];}
-        ps.motion_bound      = particle_motion_speed_bound(i, P_dev, CellP_dev);
-        ps.type              = (int) pa->Type;
-        ps.kernel_radius     = pa->KernelRadius;
-        ps.max_kernel_radius = maxKR;
-        ps.force_softening   = gpu_force_softening_kernelradius(P_dev, i);
-        ps.particle_divvel   = particle_radius_growth_rate(i, P_dev);
-        ps.radius_drifts     = particle_radius_drifts_with_divergence_P(i, P_dev);
+            /* Load this leaf's fields + per-particle precomputes into the shared kernel's POD (native
+             * double; weighted products are formed at double precision inside the helper).  The gates and
+             * formulas live in moment_source_from_particle. */
+            moment_particle_src<MyGravFloat> ps = {};
+            ps.mass = pa->Mass;
+            for(int kk = 0; kk < 3; kk++) {ps.pos[kk] = pa->Pos[kk]; ps.vel[kk] = pa->Vel[kk];}
+            ps.motion_bound      = particle_motion_speed_bound(i, P_dev, CellP_dev);
+            ps.type              = (int) pa->Type;
+            ps.kernel_radius     = pa->KernelRadius;
+            ps.max_kernel_radius = maxKR;
+            ps.force_softening   = gpu_force_softening_kernelradius(P_dev, i);
+            ps.particle_divvel   = particle_radius_growth_rate(i, P_dev);
+            ps.radius_drifts     = particle_radius_drifts_with_divergence_P(i, P_dev);
 #if defined(SINK_ALPHADISK_ACCRETION) && defined(RT_USE_TREECOL_FOR_NH)
-        ps.sink_mass_reservoir = pa->Sink_Mass_Reservoir;
+            ps.sink_mass_reservoir = pa->Sink_Mass_Reservoir;
 #endif
 #ifdef RT_USE_GRAVTREE
-        for(int b = 0; b < N_RT_FREQ_BINS; b++) {ps.src_lum[b] = src_lum_[(long)i * N_RT_FREQ_BINS + b];}
+            for(int b = 0; b < N_RT_FREQ_BINS; b++) {ps.src_lum[b] = src_lum_[(long)i * N_RT_FREQ_BINS + b];}
 #ifdef CHIMES_STELLAR_FLUXES
-        for(int b = 0; b < CHIMES_LOCAL_UV_NBINS; b++) {
-            ps.src_lum_G0 [b] = src_lum_G0_ [(long)i * CHIMES_LOCAL_UV_NBINS + b];
-            ps.src_lum_ion[b] = src_lum_ion_[(long)i * CHIMES_LOCAL_UV_NBINS + b];
-        }
+            for(int b = 0; b < CHIMES_LOCAL_UV_NBINS; b++) {
+                ps.src_lum_G0 [b] = src_lum_G0_ [(long)i * CHIMES_LOCAL_UV_NBINS + b];
+                ps.src_lum_ion[b] = src_lum_ion_[(long)i * CHIMES_LOCAL_UV_NBINS + b];
+            }
 #endif
 #endif
 #ifdef SINK_PHOTONMOMENTUM
-        ps.bh_lum = bh_lum_[i];
-        for(int kk = 0; kk < 3; kk++) {ps.bh_angle[kk] = bh_angle_[i][kk];}
+            ps.bh_lum = bh_lum_[i];
+            for(int kk = 0; kk < 3; kk++) {ps.bh_angle[kk] = bh_angle_[i][kk];}
 #endif
 #ifdef COSMIC_RAY_SUBGRID_LEBRON
-        ps.cr_inject = cr_inj_[i];
+            ps.cr_inject = cr_inj_[i];
 #endif
 #if defined(SPECIAL_POINT_MOTION)
-        for(int kk = 0; kk < 3; kk++) {ps.acc_prevstep[kk] = pa->Acc_Total_PrevStep[kk];}
+            for(int kk = 0; kk < 3; kk++) {ps.acc_prevstep[kk] = pa->Acc_Total_PrevStep[kk];}
 #endif
 #if defined(SINK_CALC_DISTANCES) && defined(SINGLE_STAR_TIMESTEPPING) && defined(SINGLE_STAR_FB_TIMESTEPLIMIT)
-        ps.max_feedback_vel = pa->MaxFeedbackVel;
+            ps.max_feedback_vel = pa->MaxFeedbackVel;
 #endif
 #ifdef ADAPTIVE_GRAVSOFT_FROM_TIDAL_CRITERION
-        for(int kk = 0; kk < 6; kk++) {ps.tidal_prevstep[kk] = pa->tidal_tensorps_prevstep.data[kk];}
+            for(int kk = 0; kk < 6; kk++) {ps.tidal_prevstep[kk] = pa->tidal_tensorps_prevstep.data[kk];}
 #endif
 
-        moment_accum_add_particle<moment_atomic_ops, MyGravFloat>(mr_ref_(scr, k), ps);
-    });
+            moment_accum_add_particle<moment_atomic_ops, MyGravFloat>(mr_ref_(scr, k), ps);
+        });
 
-    /* ---------------- Kernel 4: bottom-up walk via father chain -------- */
-    /* The counter hands a node to whichever thread arrives last, and that thread then reads its
-     * children's accumulated payloads with plain loads. The payload adds are atomic, but Kokkos
-     * atomics are relaxed: the decrement orders nothing, so on a device whose caches are not
-     * coherent the winner can read values that predate the losers' contributions. x86 and OpenMP
-     * get the ordering for free from the hardware model, which is why only the device backend
-     * miscounts. Make it explicit: release before signalling a parent, acquire after winning one. */
-    Kokkos::parallel_for("mr_walk_up", n, KOKKOS_LAMBDA(int k0) {
-        if(Kokkos::atomic_fetch_sub(&scr.pending(k0), 1) != 1) {return;}
-        Kokkos::memory_fence();   /* acquire: this node's children are visible before we read them */
-        int curr = k0;
-        while(true) {
-            int f = father_soa[curr];
-            if(f < tree_base || f >= tree_base + n) {return;}
-            int kp = f - tree_base;
-            mr_propagate_to_parent_(scr, curr, kp);
-            Kokkos::memory_fence();   /* release: our contribution lands before the count can hand kp on */
-            int prev = Kokkos::atomic_fetch_sub(&scr.pending(kp), 1);
-            if(prev != 1) {return;}
-            Kokkos::memory_fence();   /* acquire: all of kp's children are visible before the next lap */
-            curr = kp;
-        }
-    });
+        /* ---------------- Kernel 4: bottom-up walk via father chain -------- */
+        /* The counter hands a node to whichever thread arrives last, and that thread then reads its
+         * children's accumulated payloads with plain loads. The payload adds are atomic, but Kokkos
+         * atomics are relaxed: the decrement orders nothing, so on a device whose caches are not
+         * coherent the winner can read values that predate the losers' contributions. x86 and OpenMP
+         * get the ordering for free from the hardware model, which is why only the device backend
+         * miscounts. Make it explicit: release before signalling a parent, acquire after winning one. */
+        Kokkos::parallel_for("mr_walk_up", n, KOKKOS_LAMBDA(int k0) {
+            if(Kokkos::atomic_fetch_sub(&scr.pending(k0), 1) != 1) {return;}
+            Kokkos::memory_fence();   /* acquire: this node's children are visible before we read them */
+            int curr = k0;
+            while(true) {
+                int f = father_soa[curr];
+                if(f < tree_base || f >= tree_base + n) {return;}
+                int kp = f - tree_base;
+                mr_propagate_to_parent_(scr, curr, kp);
+                Kokkos::memory_fence();   /* release: our contribution lands before the count can hand kp on */
+                int prev = Kokkos::atomic_fetch_sub(&scr.pending(kp), 1);
+                if(prev != 1) {return;}
+                Kokkos::memory_fence();   /* acquire: all of kp's children are visible before the next lap */
+                curr = kp;
+            }
+        });
 
-    /* ---------------- Kernel 5: normalize ------------------------------ */
-    Kokkos::parallel_for("mr_normalize", n, KOKKOS_LAMBDA(int k) {
-        mr_normalize_payloads_(scr, k, center_soa[k]);
-    });
+        /* ---------------- Kernel 5: normalize ------------------------------ */
+        Kokkos::parallel_for("mr_normalize", n, KOKKOS_LAMBDA(int k) {
+            mr_normalize_payloads_(scr, k, center_soa[k]);
+        });
 
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("mr_moment_refresh", n);
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("mr_moment_refresh", n);
+    }
 
-    /* ---------------- Bulk deep-copy scratch → SharedSpace SoA -------- */
-    /* Wrap raw SoA pointers in unmanaged Views and deep_copy. */
-    using UV_unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
-    using ShSpace = Kokkos::View<MyGravFloat*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
-    using ShVec3  = Kokkos::View<Vec3<MyGravFloat>*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
-    using ShU32   = Kokkos::View<unsigned int*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
-    using ShLong  = Kokkos::View<long*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
-    using ShDbl   = Kokkos::View<double*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
-    using ShInt   = Kokkos::View<int*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+    {
+        GIZMO_TIMER_SCOPE("copy_moments_to_shared_soa");
+        /* ---------------- Bulk deep-copy scratch → SharedSpace SoA -------- */
+        /* Wrap raw SoA pointers in unmanaged Views and deep_copy. */
+        using UV_unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+        using ShSpace = Kokkos::View<MyGravFloat*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+        using ShVec3  = Kokkos::View<Vec3<MyGravFloat>*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+        using ShU32   = Kokkos::View<unsigned int*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+        using ShLong  = Kokkos::View<long*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+        using ShDbl   = Kokkos::View<double*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
+        using ShInt   = Kokkos::View<int*, GIZMO_KOKKOS_SHARED_SPACE, UV_unmanaged>;
 
-    Kokkos::deep_copy(ShSpace(soa->mass,    n), scr.mass);
-    Kokkos::deep_copy(ShVec3 (soa->s,       n), scr.s);
-    Kokkos::deep_copy(ShVec3 (soa->node_vs, n), scr.vs);
-    Kokkos::deep_copy(ShLong (soa->N_part,  n), scr.Npart);
-    Kokkos::deep_copy(ShSpace(soa->hmax,    n), scr.hmax);
-    Kokkos::deep_copy(ShSpace(soa->vmax,    n), scr.vmax);
-    Kokkos::deep_copy(ShSpace(soa->divVmax, n), scr.divVmax);
-    Kokkos::deep_copy(ShSpace(soa->maxsoft, n), scr.maxsoft);
-    Kokkos::deep_copy(ShU32  (soa->bitflags,n), scr.bitflags);
+        Kokkos::deep_copy(ShSpace(soa->mass,    n), scr.mass);
+        Kokkos::deep_copy(ShVec3 (soa->s,       n), scr.s);
+        Kokkos::deep_copy(ShVec3 (soa->node_vs, n), scr.vs);
+        Kokkos::deep_copy(ShLong (soa->N_part,  n), scr.Npart);
+        Kokkos::deep_copy(ShSpace(soa->hmax,    n), scr.hmax);
+        Kokkos::deep_copy(ShSpace(soa->vmax,    n), scr.vmax);
+        Kokkos::deep_copy(ShSpace(soa->divVmax, n), scr.divVmax);
+        Kokkos::deep_copy(ShSpace(soa->maxsoft, n), scr.maxsoft);
+        Kokkos::deep_copy(ShU32  (soa->bitflags,n), scr.bitflags);
 #ifdef GRAVTREE_CALCULATE_GAS_MASS_IN_NODE
-    Kokkos::deep_copy(ShSpace(soa->gasmass, n), scr.gasmass);
+        Kokkos::deep_copy(ShSpace(soa->gasmass, n), scr.gasmass);
 #endif
 #ifdef RT_USE_GRAVTREE
-    Kokkos::deep_copy(ShSpace(soa->stellar_lum, (long)n * N_RT_FREQ_BINS), scr.stellar_lum);
+        Kokkos::deep_copy(ShSpace(soa->stellar_lum, (long)n * N_RT_FREQ_BINS), scr.stellar_lum);
 #ifdef CHIMES_STELLAR_FLUXES
-    Kokkos::deep_copy(ShDbl(soa->chimes_stellar_lum_G0,  (long)n * CHIMES_LOCAL_UV_NBINS), scr.chimes_G0);
-    Kokkos::deep_copy(ShDbl(soa->chimes_stellar_lum_ion, (long)n * CHIMES_LOCAL_UV_NBINS), scr.chimes_ion);
+        Kokkos::deep_copy(ShDbl(soa->chimes_stellar_lum_G0,  (long)n * CHIMES_LOCAL_UV_NBINS), scr.chimes_G0);
+        Kokkos::deep_copy(ShDbl(soa->chimes_stellar_lum_ion, (long)n * CHIMES_LOCAL_UV_NBINS), scr.chimes_ion);
 #endif
 #endif
 #ifdef RT_SEPARATELY_TRACK_LUMPOS
-    Kokkos::deep_copy(ShVec3(soa->rt_source_lum_s,  n), scr.rt_s);
-    Kokkos::deep_copy(ShVec3(soa->rt_source_lum_vs, n), scr.rt_vs);
+        Kokkos::deep_copy(ShVec3(soa->rt_source_lum_s,  n), scr.rt_s);
+        Kokkos::deep_copy(ShVec3(soa->rt_source_lum_vs, n), scr.rt_vs);
 #endif
 #ifdef SINK_PHOTONMOMENTUM
-    Kokkos::deep_copy(ShSpace(soa->sink_lum,      n), scr.sink_lum);
-    Kokkos::deep_copy(ShVec3 (soa->sink_lum_grad, n), scr.sink_lum_grad);
+        Kokkos::deep_copy(ShSpace(soa->sink_lum,      n), scr.sink_lum);
+        Kokkos::deep_copy(ShVec3 (soa->sink_lum_grad, n), scr.sink_lum_grad);
 #endif
 #ifdef COSMIC_RAY_SUBGRID_LEBRON
-    Kokkos::deep_copy(ShSpace(soa->cr_injection, n), scr.cr_inject);
+        Kokkos::deep_copy(ShSpace(soa->cr_injection, n), scr.cr_inject);
 #endif
 #ifdef SINK_CALC_DISTANCES
-    Kokkos::deep_copy(ShSpace(soa->sink_mass, n), scr.sink_mass);
-    Kokkos::deep_copy(ShVec3 (soa->sink_pos,  n), scr.sink_pos);
+        Kokkos::deep_copy(ShSpace(soa->sink_mass, n), scr.sink_mass);
+        Kokkos::deep_copy(ShVec3 (soa->sink_pos,  n), scr.sink_pos);
 #if defined(SINK_NODE_MOTION_TRACKED)
-    Kokkos::deep_copy(ShInt  (soa->N_SINK,    n), scr.N_SINK);
-    Kokkos::deep_copy(ShVec3 (soa->sink_vel,  n), scr.sink_vel);
+        Kokkos::deep_copy(ShInt  (soa->N_SINK,    n), scr.N_SINK);
+        Kokkos::deep_copy(ShVec3 (soa->sink_vel,  n), scr.sink_vel);
 #endif
 #if defined(SPECIAL_POINT_MOTION)
-    Kokkos::deep_copy(ShVec3 (soa->sink_acc,  n), scr.sink_acc);
+        Kokkos::deep_copy(ShVec3 (soa->sink_acc,  n), scr.sink_acc);
 #endif
 #if defined(SINGLE_STAR_TIMESTEPPING) && defined(SINGLE_STAR_FB_TIMESTEPLIMIT)
-    Kokkos::deep_copy(ShSpace(soa->MaxFeedbackVel, n), scr.max_fbvel);
+        Kokkos::deep_copy(ShSpace(soa->MaxFeedbackVel, n), scr.max_fbvel);
 #endif
 #endif
 #ifdef ADAPTIVE_GRAVSOFT_FROM_TIDAL_CRITERION
-    Kokkos::deep_copy(ShSpace(soa->tidal_tensorps, (long)n * 6), scr.tidal);
+        Kokkos::deep_copy(ShSpace(soa->tidal_tensorps, (long)n * 6), scr.tidal);
 #endif
 #ifdef DM_SCALARFIELD_SCREENING
-    Kokkos::deep_copy(ShSpace(soa->mass_dm, n), scr.mass_dm);
-    Kokkos::deep_copy(ShVec3 (soa->s_dm,    n), scr.s_dm);
-    Kokkos::deep_copy(ShVec3 (soa->vs_dm,   n), scr.vs_dm);
+        Kokkos::deep_copy(ShSpace(soa->mass_dm, n), scr.mass_dm);
+        Kokkos::deep_copy(ShVec3 (soa->s_dm,    n), scr.s_dm);
+        Kokkos::deep_copy(ShVec3 (soa->vs_dm,   n), scr.vs_dm);
 #endif
 
-    Kokkos::fence();
+        Kokkos::fence();
+    }
 
     /* ---------------- AoS write-back ---------------------------------- */
     gpu_moment_writeback_to_aos(n);
@@ -1047,6 +1058,7 @@ extern "C" void gpu_moment_refresh_release(void)
 /* =================================================================== */
 extern "C" void gpu_moment_writeback_to_aos(int n)
 {
+    GIZMO_TIMER_FUNCTION();
     struct gpu_gravity_tree_soa_t *soa = gpu_gravity_tree_soa();
     if(!soa) {return;}
     int tree_base = All.TreeNodeIndexBase;

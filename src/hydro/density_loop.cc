@@ -180,6 +180,7 @@ DensitySpec::CallScalars DensitySpec::populate_call_scalars(
  * a contiguous std::vector<int> for the runner. ======================== */
 std::vector<int> density_build_active_list(void)
 {
+    GIZMO_TIMER_FUNCTION();
     std::vector<int> active_list_concat;
     active_list_concat.reserve(NumPart);
     for (int i : ActiveParticleList) {
@@ -202,6 +203,7 @@ std::vector<int> density_build_active_list(void)
  * must keep both alive for the duration of the runner call. ============ */
 std::vector<NlrSubgroup> density_build_subgroups(int *active_indices, int num_active)
 {
+    GIZMO_TIMER_FUNCTION();
     std::vector<NlrSubgroup> subgroups;
     NlrSubgroup sg{};
     sg.j_type_bitmask    = (1u << 0);   /* gas only */
@@ -757,6 +759,7 @@ void density_finalize_post_runner(const std::vector<int>& active_list_concat,
                                   DensitySpec::Aux& aux,
                                   const struct global_data_all_processes* host_all)
 {
+    GIZMO_TIMER_FUNCTION();
     const int N = (int)active_list_concat.size();
 
     /* Parallel-for: legacy uses #pragma omp parallel for schedule(dynamic)

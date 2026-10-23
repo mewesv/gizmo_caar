@@ -61,29 +61,39 @@ void find_timesteps(void)
         double fastwavespeed = 0.0;
         double fastwavedecay = 0.0;
         double fac_magnetic_pressure = 1. / All.cf_atime;
+        {
+            GIZMO_TIMER_SCOPE("scan_fast_wave_speeds");
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) reduction(max:fastwavespeed,fastwavedecay)
 #endif
-        for(i=0;i<NumPart;i++)
-        {
-            if(P[i].Type==0)
+            for(i=0;i<NumPart;i++)
             {
-                double vsig2 = 0.5  * fabs(CellP[i].MaxSignalVel); // in v_phys units //
-                double vA2_for_vsig = 0; // the magnetic term needs a density to divide by; a cell without one contributes only its sound speed, rather than an infinity that this max-reduction would then spread to every rank
-                if(CellP[i].Density > 0) {vA2_for_vsig = fac_magnetic_pressure * CellP[i].Bfield().norm_sq() / CellP[i].Density;}
-                double vsig1 = sqrt( CellP[i].effective_soundspeed()*CellP[i].effective_soundspeed() + vA2_for_vsig );
-                double vsig0 = DMAX(vsig1,vsig2);
+                if(P[i].Type==0)
+                {
+                    double vsig2 = 0.5  * fabs(CellP[i].MaxSignalVel); // in v_phys units //
+                    double vA2_for_vsig = 0; // the magnetic term needs a density to divide by; a cell without one contributes only its sound speed, rather than an infinity that this max-reduction would then spread to every rank
+                    if(CellP[i].Density > 0) {vA2_for_vsig = fac_magnetic_pressure * CellP[i].Bfield().norm_sq() / CellP[i].Density;}
+                    double vsig1 = sqrt( CellP[i].effective_soundspeed()*CellP[i].effective_soundspeed() + vA2_for_vsig );
+                    double vsig0 = DMAX(vsig1,vsig2);
 
-                if(vsig0 > fastwavespeed) fastwavespeed = vsig0; // physical unit
-                double hsig0 = P[i].Get_Particle_Size() * All.cf_atime; // physical unit
-                if(vsig0/hsig0 > fastwavedecay) fastwavedecay = vsig0 / hsig0; // physical unit
+                    if(vsig0 > fastwavespeed) fastwavespeed = vsig0; // physical unit
+                    double hsig0 = P[i].Get_Particle_Size() * All.cf_atime; // physical unit
+                    if(vsig0/hsig0 > fastwavedecay) fastwavedecay = vsig0 / hsig0; // physical unit
+                }
             }
         }
+
         /* if desired, can just do this by domain; otherwise we use an MPI call over all domains to collect */
         double fastwavespeed_max_glob=fastwavespeed;
-        MPI_Allreduce(&fastwavespeed, &fastwavespeed_max_glob, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce_fast_wave_speeds");
+            MPI_Allreduce(&fastwavespeed, &fastwavespeed_max_glob, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        }
         double fastwavedecay_max_glob=fastwavedecay;
-        MPI_Allreduce(&fastwavedecay, &fastwavedecay_max_glob, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce_fast_wave_speeds");
+            MPI_Allreduce(&fastwavedecay, &fastwavedecay_max_glob, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        }
         /* now set the variables */
         All.FastestWaveSpeed = fastwavespeed_max_glob;
         All.FastestWaveDecay = fastwavedecay_max_glob;
@@ -113,8 +123,14 @@ void find_timesteps(void)
     ti_stepmax = TIMEBASE;
     while(ti_stepmax > ti_max) {ti_stepmax >>= 1;}
     integertime ti_min_glob, ti_max_glob;
-    MPI_Allreduce(&ti_step, &ti_min_glob, 1, MPI_TYPE_TIME, MPI_MIN, MPI_COMM_WORLD);
-    MPI_Allreduce(&ti_stepmax, &ti_max_glob, 1, MPI_TYPE_TIME, MPI_MAX, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(&ti_step, &ti_min_glob, 1, MPI_TYPE_TIME, MPI_MIN, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(&ti_stepmax, &ti_max_glob, 1, MPI_TYPE_TIME, MPI_MAX, MPI_COMM_WORLD);
+    }
 #if !defined(FORCE_EQUAL_TIMESTEPS) && defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
 #if defined(USE_TIMESTEP_DILATION_FOR_ZOOMS)
     ti_min_glob <<= 2; // 2^N times min timestep - shift to N bins higher
@@ -126,129 +142,138 @@ void find_timesteps(void)
 #endif
 
 
-    /* Now assign new timesteps  */
-    for (int i : ActiveParticleList)
     {
-        domain_record_step_work(i);   /* this step's work, before the timebin below changes */
+        GIZMO_TIMER_SCOPE("assign_particle_timesteps");
+        /* Now assign new timesteps  */
+        for (int i : ActiveParticleList)
+        {
+            domain_record_step_work(i);   /* this step's work, before the timebin below changes */
 #ifdef FORCE_EQUAL_TIMESTEPS
-        ti_step = ti_min_glob;  /* note that the dilation factor is already applied to ti_min_glob above - re-applying here would double-count it */
+            ti_step = ti_min_glob;  /* note that the dilation factor is already applied to ti_min_glob above - re-applying here would double-count it */
 #else
-        ti_step = get_timestep(i, &aphys, 0);
-        ti_step = (integertime)(((double)ti_step) / timestep_dilation_factor(i, P)); /* get_timestep above froze the factor for this particle */
+            ti_step = get_timestep(i, &aphys, 0);
+            ti_step = (integertime)(((double)ti_step) / timestep_dilation_factor(i, P)); /* get_timestep above froze the factor for this particle */
 #endif
-        
-#if !defined(FORCE_EQUAL_TIMESTEPS) && defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
-        if(ti_step < 0) {ti_step = ti_min_glob;}
-        if(is_particle_a_special_zoom_target(i)) {
-            if(ti_step > ti_min_glob) {ti_step = ti_min_glob;}
-            if(ti_step > ti_max_glob) {ti_step = ti_max_glob;}
-        }
-        //if(ti_min_glob > 0) {if(is_particle_a_special_zoom_target(i)) {while(ti_step > ti_min_glob) {ti_step >>= 1;}}} // set this per the above loop to minimum threshold relative to previous steps
-#endif
-        /* make it a power 2 subdivision */
-        ti_min = TIMEBASE;
-        while(ti_min > ti_step) {ti_min >>= 1;}
-        ti_step = ti_min;
-        bin = get_timestep_bin(ti_step);
-        binold = P[i].TimeBin;
-        if(bin > binold)		/* timestep wants to increase */
-        {
-            while(TimeBinActive[bin] == 0 && bin > binold) {bin--;}	/* make sure the new step is synchronized */
-            ti_step = GET_INTEGERTIME_FROM_TIMEBIN(bin);
-        }
-        if(All.Ti_Current >= TIMEBASE) {ti_step = 0; bin = 0;} /* we here finish the last timestep. */
 
-        if((TIMEBASE - All.Ti_Current) < ti_step)	/* check that we don't run beyond the end */
-        {
-            printf("we are beyond the end of the timeline (task=%d) -- clamping ti_step and requesting controlled stop\n", ThisTask); fflush(stdout);	/* should not happen */
-            endrun(90001005);	/* graceful bad-stop; the clamp below keeps ti_step finite; drains at the find_timesteps poll (no per-particle collective) */
-            ti_step = TIMEBASE - All.Ti_Current;
+#if !defined(FORCE_EQUAL_TIMESTEPS) && defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
+            if(ti_step < 0) {ti_step = ti_min_glob;}
+            if(is_particle_a_special_zoom_target(i)) {
+                if(ti_step > ti_min_glob) {ti_step = ti_min_glob;}
+                if(ti_step > ti_max_glob) {ti_step = ti_max_glob;}
+            }
+            //if(ti_min_glob > 0) {if(is_particle_a_special_zoom_target(i)) {while(ti_step > ti_min_glob) {ti_step >>= 1;}}} // set this per the above loop to minimum threshold relative to previous steps
+#endif
+            /* make it a power 2 subdivision */
             ti_min = TIMEBASE;
             while(ti_min > ti_step) {ti_min >>= 1;}
             ti_step = ti_min;
-        }
-
-        if(bin != binold)
-        {
-            TimeBinCount[binold]--;
-            if(P[i].Type == 0)
+            bin = get_timestep_bin(ti_step);
+            binold = P[i].TimeBin;
+            if(bin > binold)		/* timestep wants to increase */
             {
-                TimeBinCountGas[binold]--;
-#ifdef GALSF
-                TimeBinSfr[binold] -= CellP[i].Sfr;
-                TimeBinSfr[bin] += CellP[i].Sfr;
-#endif
+                while(TimeBinActive[bin] == 0 && bin > binold) {bin--;}	/* make sure the new step is synchronized */
+                ti_step = GET_INTEGERTIME_FROM_TIMEBIN(bin);
             }
+            if(All.Ti_Current >= TIMEBASE) {ti_step = 0; bin = 0;} /* we here finish the last timestep. */
+
+            if((TIMEBASE - All.Ti_Current) < ti_step)	/* check that we don't run beyond the end */
+            {
+                printf("we are beyond the end of the timeline (task=%d) -- clamping ti_step and requesting controlled stop\n", ThisTask); fflush(stdout);	/* should not happen */
+                endrun(90001005);	/* graceful bad-stop; the clamp below keeps ti_step finite; drains at the find_timesteps poll (no per-particle collective) */
+                ti_step = TIMEBASE - All.Ti_Current;
+                ti_min = TIMEBASE;
+                while(ti_min > ti_step) {ti_min >>= 1;}
+                ti_step = ti_min;
+            }
+
+            if(bin != binold)
+            {
+                TimeBinCount[binold]--;
+                if(P[i].Type == 0)
+                {
+                    TimeBinCountGas[binold]--;
+#ifdef GALSF
+                    TimeBinSfr[binold] -= CellP[i].Sfr;
+                    TimeBinSfr[bin] += CellP[i].Sfr;
+#endif
+                }
 
 #ifdef SINK_PARTICLES
-            if(P[i].Type == 5)
-            {
-                TimeBin_Sink_mass[binold] -= P[i].Sink_Mass;
-                TimeBin_Sink_dynamicalmass[binold] -= P[i].Mass;
-                TimeBin_Sink_Mdot[binold] -= P[i].Sink_Mdot;
-                if(P[i].Sink_Mass > 0) {TimeBin_Sink_Medd[binold] -= P[i].Sink_Mdot / P[i].Sink_Mass;}
-                TimeBin_Sink_mass[bin] += P[i].Sink_Mass;
-                TimeBin_Sink_dynamicalmass[bin] += P[i].Mass;
-                TimeBin_Sink_Mdot[bin] += P[i].Sink_Mdot;
-                if(P[i].Sink_Mass > 0) {TimeBin_Sink_Medd[bin] += P[i].Sink_Mdot / P[i].Sink_Mass;}
-            }
+                if(P[i].Type == 5)
+                {
+                    TimeBin_Sink_mass[binold] -= P[i].Sink_Mass;
+                    TimeBin_Sink_dynamicalmass[binold] -= P[i].Mass;
+                    TimeBin_Sink_Mdot[binold] -= P[i].Sink_Mdot;
+                    if(P[i].Sink_Mass > 0) {TimeBin_Sink_Medd[binold] -= P[i].Sink_Mdot / P[i].Sink_Mass;}
+                    TimeBin_Sink_mass[bin] += P[i].Sink_Mass;
+                    TimeBin_Sink_dynamicalmass[bin] += P[i].Mass;
+                    TimeBin_Sink_Mdot[bin] += P[i].Sink_Mdot;
+                    if(P[i].Sink_Mass > 0) {TimeBin_Sink_Medd[bin] += P[i].Sink_Mdot / P[i].Sink_Mass;}
+                }
 #endif
-            prev = PrevInTimeBin[i];
-            next = NextInTimeBin[i];
+                prev = PrevInTimeBin[i];
+                next = NextInTimeBin[i];
 
-            if(FirstInTimeBin[binold] == i) {FirstInTimeBin[binold] = next;}
-            if(LastInTimeBin[binold] == i) {LastInTimeBin[binold] = prev;}
-            if(prev >= 0) {NextInTimeBin[prev] = next;}
-            if(next >= 0) {PrevInTimeBin[next] = prev;}
+                if(FirstInTimeBin[binold] == i) {FirstInTimeBin[binold] = next;}
+                if(LastInTimeBin[binold] == i) {LastInTimeBin[binold] = prev;}
+                if(prev >= 0) {NextInTimeBin[prev] = next;}
+                if(next >= 0) {PrevInTimeBin[next] = prev;}
 
-            if(TimeBinCount[bin] > 0)
-            {
-                PrevInTimeBin[i] = LastInTimeBin[bin];
-                NextInTimeBin[LastInTimeBin[bin]] = i;
-                NextInTimeBin[i] = -1;
-                LastInTimeBin[bin] = i;
+                if(TimeBinCount[bin] > 0)
+                {
+                    PrevInTimeBin[i] = LastInTimeBin[bin];
+                    NextInTimeBin[LastInTimeBin[bin]] = i;
+                    NextInTimeBin[i] = -1;
+                    LastInTimeBin[bin] = i;
+                }
+                else
+                {
+                    FirstInTimeBin[bin] = LastInTimeBin[bin] = i;
+                    PrevInTimeBin[i] = NextInTimeBin[i] = -1;
+                }
+                TimeBinCount[bin]++;
+                if(P[i].Type == 0) {TimeBinCountGas[bin]++;}
+                P[i].TimeBin = bin;
             }
-            else
-            {
-                FirstInTimeBin[bin] = LastInTimeBin[bin] = i;
-                PrevInTimeBin[i] = NextInTimeBin[i] = -1;
-            }
-            TimeBinCount[bin]++;
-            if(P[i].Type == 0) {TimeBinCountGas[bin]++;}
-            P[i].TimeBin = bin;
-        }
 
-        ti_step_old = P[i].dt_step;
-        P[i].Ti_begstep += ti_step_old;
-        P[i].dt_step = ti_step;
+            ti_step_old = P[i].dt_step;
+            P[i].Ti_begstep += ti_step_old;
+            P[i].dt_step = ti_step;
 #ifdef SINK_INTERACT_ON_GAS_TIMESTEP
-        if(P[i].Type == 5){
-            if(All.Ti_Current == 0) { // first timestep
-                P[i].dt_since_last_gas_search = get_physical_timestep_from_timebin(P[i].TimeBin, i, P);
-                P[i].do_gas_search_this_timestep = 1;
-            } else {
-                P[i].dt_since_last_gas_search += get_physical_timestep_from_timebin(P[i].TimeBin, i, P);
-                if(P[i].dt_since_last_gas_search > 0.49 * get_physical_timestep_from_timebin(P[i].Sink_TimeBinGasNeighbor, i, P)){
+            if(P[i].Type == 5){
+                if(All.Ti_Current == 0) { // first timestep
+                    P[i].dt_since_last_gas_search = get_physical_timestep_from_timebin(P[i].TimeBin, i, P);
                     P[i].do_gas_search_this_timestep = 1;
-                } else {P[i].do_gas_search_this_timestep = 0;}
-            }
+                } else {
+                    P[i].dt_since_last_gas_search += get_physical_timestep_from_timebin(P[i].TimeBin, i, P);
+                    if(P[i].dt_since_last_gas_search > 0.49 * get_physical_timestep_from_timebin(P[i].Sink_TimeBinGasNeighbor, i, P)){
+                        P[i].do_gas_search_this_timestep = 1;
+                    } else {P[i].do_gas_search_this_timestep = 0;}
+                }
 #if defined(SINGLE_STAR_STARFORGE_PROTOSTELLAR_EVOLUTION)
-	    if(P[i].ProtoStellarStage == 6) {P[i].do_gas_search_this_timestep = 1;} // always do gas search if we're rapidly spawning in new gas shells
+            if(P[i].ProtoStellarStage == 6) {P[i].do_gas_search_this_timestep = 1;} // always do gas search if we're rapidly spawning in new gas shells
 #endif
-        }
+            }
 #endif
-        
+
 #ifdef SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM
-        if(is_particle_a_special_zoom_target(i) && P[i].Mass > 0) {xyz_local[j_specialpartical_counter][0]=P[i].Pos[0]; xyz_local[j_specialpartical_counter][1]=P[i].Pos[1]; xyz_local[j_specialpartical_counter][2]=P[i].Pos[2]; special_particle_active_with_this_index[j_specialpartical_counter]=i; special_particle_mass_local[j_specialpartical_counter]=P[i].Mass; j_specialpartical_counter++;} // active on this processor, set
+            if(is_particle_a_special_zoom_target(i) && P[i].Mass > 0) {xyz_local[j_specialpartical_counter][0]=P[i].Pos[0]; xyz_local[j_specialpartical_counter][1]=P[i].Pos[1]; xyz_local[j_specialpartical_counter][2]=P[i].Pos[2]; special_particle_active_with_this_index[j_specialpartical_counter]=i; special_particle_mass_local[j_specialpartical_counter]=P[i].Mass; j_specialpartical_counter++;} // active on this processor, set
 #endif
-        
+
+        }
     }
 
 #ifdef SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM
-    MPI_Allreduce(xyz_local, xyz_global, 3*SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD); // broadcast the new position of the special particle
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(xyz_local, xyz_global, 3*SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    } // broadcast the new position of the special particle
     double mass_to_sum_local[SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM],  mass_to_sum_global[SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM]={0}; // define mass variables for passing
     int k; for(k=0;k<SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM;k++) {mass_to_sum_local[k] = All.Mass_Accreted_By_SpecialParticle[k];}
-    MPI_Allreduce(mass_to_sum_local, mass_to_sum_global, SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); // broadcast the mass update of the special particle
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(mass_to_sum_local, mass_to_sum_global, SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    } // broadcast the mass update of the special particle
     for(k=0;k<SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM;k++)
     {
         if(xyz_global[k][0] > -1.e10) { // this indicates that the special particle was active on one task
@@ -257,7 +282,10 @@ void find_timesteps(void)
             All.Mass_Accreted_By_SpecialParticle[k] = 0; // reset this variable on all processors because we have added it now to the special particle, to conserve mass properly
         }
     }
-    MPI_Allreduce(special_particle_mass_local, special_particle_mass_global, SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD); // broadcast the mass of the special particle
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(special_particle_mass_local, special_particle_mass_global, SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    } // broadcast the mass of the special particle
     for(k=0;k<SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM;k++) {if(special_particle_mass_global[k] > 0) {All.Mass_of_SpecialParticle[k] = special_particle_mass_global[k];}} // update the mass of the special particle for everyone to use
     // ???
 #endif
@@ -1311,6 +1339,7 @@ integertime get_timestep(int p,		/*!< particle index */
  */
 void find_dt_displacement_constraint(double hfac /*!<  should be  a^2*H(a)  */ )
 {
+    GIZMO_TIMER_FUNCTION();
     int i, type;
     int count[6];
     long long count_sum[6];
@@ -1329,23 +1358,35 @@ void find_dt_displacement_constraint(double hfac /*!<  should be  a^2*H(a)  */ )
             mnm[type] = 0;
         }
 
-        for(i = 0; i < NumPart; i++)
         {
-            if(P[i].Mass > 0)
+            GIZMO_TIMER_SCOPE("scan_displacement_constraints");
+            for(i = 0; i < NumPart; i++)
             {
-                double v2 = P[i].Vel.norm_sq();
-                if(v2 > 0 && isfinite(v2)) {
-                    count[P[i].Type]++;
-                    if(P[i].Type == 0) {v[P[i].Type] += P[i].Mass * v2;} else {v[P[i].Type] += v2;} /* for gas use a weighted average to deal with extreme cell-mass difference situations */
-                    if(mim[P[i].Type] > P[i].Mass) {mim[P[i].Type] = P[i].Mass;}
-                    mnm[P[i].Type] += P[i].Mass;
+                if(P[i].Mass > 0)
+                {
+                    double v2 = P[i].Vel.norm_sq();
+                    if(v2 > 0 && isfinite(v2)) {
+                        count[P[i].Type]++;
+                        if(P[i].Type == 0) {v[P[i].Type] += P[i].Mass * v2;} else {v[P[i].Type] += v2;} /* for gas use a weighted average to deal with extreme cell-mass difference situations */
+                        if(mim[P[i].Type] > P[i].Mass) {mim[P[i].Type] = P[i].Mass;}
+                        mnm[P[i].Type] += P[i].Mass;
+                    }
                 }
             }
         }
 
-        MPI_Allreduce(v, v_sum, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(mim, min_mass, 6, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-        MPI_Allreduce(mnm, mean_mass, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(v, v_sum, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        }
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(mim, min_mass, 6, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        }
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(mnm, mean_mass, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        }
         sumup_large_ints(6, count, count_sum);
         if(mean_mass[0] > 0) {v_sum[0] /= mean_mass[0];} /* for gas use a weighted average to deal with extreme cell-mass difference situations */
 
@@ -1440,6 +1481,7 @@ int get_timestep_bin(integertime ti_step)
  * index mapping changed (domain decomp / rearrange / init) or on first use. */
 void wakeup_sidecar_rebuild(void)
 {
+    GIZMO_TIMER_FUNCTION();
     if(WakeupDirty) {
         for(int i = 0; i < NumPart; i++) { WakeupDirty[i] = (P[i].wakeup != 0) ? 1 : 0; }
     }
@@ -1451,6 +1493,7 @@ static std::vector<int> WokenParticles;
 
 void process_wake_ups(void)
 {
+    GIZMO_TIMER_FUNCTION();
     WokenParticles.clear();
 #ifdef FORCE_EQUAL_TIMESTEPS
     return; /* no wakeups if all particles are on the same timestep */
@@ -1473,7 +1516,10 @@ void process_wake_ups(void)
         }
     }
 
-    MPI_Allreduce(&ti_next_kick, &ti_next_kick_global, 1, MPI_TYPE_TIME, MPI_MIN, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(&ti_next_kick, &ti_next_kick_global, 1, MPI_TYPE_TIME, MPI_MIN, MPI_COMM_WORLD);
+    }
 
     PRINT_STATUS("Predicting next timestep: %g", (ti_next_kick_global - All.Ti_Current) * All.Timebase_interval);
     max_time_bin_active = 0;
@@ -1488,7 +1534,10 @@ void process_wake_ups(void)
     bin = 0; for(n = 0; n < TIMEBINS; n++) {if(TimeBinCount[n] > 0) {bin = n; break;}}
     n = 0;
 
-    MPI_Allreduce(&NeedToWakeupParticles_local, &NeedToWakeupParticles, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD); // if one process processes wakeups then they all should, just in case a woke particle gets swapped to another process before we get here
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(&NeedToWakeupParticles_local, &NeedToWakeupParticles, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    } // if one process processes wakeups then they all should, just in case a woke particle gets swapped to another process before we get here
 
     int wakeup_bin_offset = 0;
     while(((integertime)1 << wakeup_bin_offset) < (integertime)WAKEUP) wakeup_bin_offset++;
@@ -1509,8 +1558,11 @@ void process_wake_ups(void)
 	    }
 	}
 	int lowest_occupied_active_bin = TIMEBINS;
-	MPI_Allreduce(&local_lowest_occupied_active_bin, &lowest_occupied_active_bin,
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_lowest_occupied_active_bin, &lowest_occupied_active_bin,
 	              1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        }
 
 	/* Dirty-sidecar scan: reject on the contiguous WakeupDirty byte array
 	 * instead of striding the fat P[] struct. Rebuild from P[] if the index

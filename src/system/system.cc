@@ -1,3 +1,4 @@
+#include "timer.h"
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,10 +180,14 @@ void minimum_large_ints(int n, long long *src, long long *res)
 
 void sumup_large_ints(int n, int *src, long long *res)
 {
+    GIZMO_TIMER_FUNCTION();
   int i, j, *numlist;
 
   numlist = (int *) mymalloc("numlist", NTask * n * sizeof(int));
-  MPI_Allgather(src, n, MPI_INT, numlist, n, MPI_INT, MPI_COMM_WORLD);
+  {
+      GIZMO_TIMER_SCOPE("MPI_Allgather");
+    MPI_Allgather(src, n, MPI_INT, numlist, n, MPI_INT, MPI_COMM_WORLD);
+  }
 
   for(j = 0; j < n; j++)
     res[j] = 0;

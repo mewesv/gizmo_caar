@@ -1,3 +1,4 @@
+#include "../system/timer.h"
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@ void apply_long_range_kick(integertime tstart, integertime tend);
 
 void do_first_halfstep_kick(void)
 {
+    GIZMO_TIMER_FUNCTION();
     int i; integertime ti_step, tstart=0, tend=0;
     
 #ifdef TURB_DRIVING
@@ -42,28 +44,32 @@ void do_first_halfstep_kick(void)
         apply_long_range_kick(tstart, tend);
     }
 #endif
+    {
+        GIZMO_TIMER_SCOPE("kick_particles");
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) private(ti_step, tstart, tend)
 #endif
 #ifdef HYDRO_MESHLESS_FINITE_VOLUME
-    /* as currently written with some revisions to MFV methods, should only update on active timesteps */
-    for(i = 0; i < NumPart; i++)
-    {
-        if((TimeBinActive[P[i].TimeBin]) || (P[i].Type==0)) /* active OR gas, need to check each timestep to ensure manifest conservation */
-#else
-    for (int _apl = 0; _apl < (int)ActiveParticleList.size(); _apl++) /* 'full' kick for active particles */
-    { int i = ActiveParticleList[_apl];
-#endif
+        /* as currently written with some revisions to MFV methods, should only update on active timesteps */
+        for(i = 0; i < NumPart; i++)
         {
-            if(P[i].Mass > 0)
+            if((TimeBinActive[P[i].TimeBin]) || (P[i].Type==0)) /* active OR gas, need to check each timestep to ensure manifest conservation */
+#else
+        for (int _apl = 0; _apl < (int)ActiveParticleList.size(); _apl++) /* 'full' kick for active particles */
+        { int i = ActiveParticleList[_apl];
+#endif
             {
-                ti_step = P[i].integertime_step();
-                tstart = P[i].Ti_begstep;	/* beginning of step */
-                tend = P[i].Ti_begstep + ti_step / 2;	/* midpoint of step */
-                do_the_kick(i, tstart, tend, P[i].Ti_current, 0);
+                if(P[i].Mass > 0)
+                {
+                    ti_step = P[i].integertime_step();
+                    tstart = P[i].Ti_begstep;	/* beginning of step */
+                    tend = P[i].Ti_begstep + ti_step / 2;	/* midpoint of step */
+                    do_the_kick(i, tstart, tend, P[i].Ti_current, 0);
+                }
             }
-        }
-    } // for(i = 0; i < NumPart; i++) //
+        } // for(i = 0; i < NumPart; i++) //
+    }
+
 #if defined(CBE_INTEGRATOR)
     {
         int n = (int)ActiveParticleList.size();
@@ -87,6 +93,7 @@ void do_first_halfstep_kick(void)
 
 void do_second_halfstep_kick(void)
 {
+    GIZMO_TIMER_FUNCTION();
     int i; integertime ti_step, tstart=0, tend=0;
 
 #if defined(CBE_INTEGRATOR)
@@ -122,28 +129,32 @@ void do_second_halfstep_kick(void)
         apply_long_range_kick(tstart, tend);
     }
 #endif
+    {
+        GIZMO_TIMER_SCOPE("kick_particles");
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) private(ti_step, tstart, tend)
 #endif
 #ifdef HYDRO_MESHLESS_FINITE_VOLUME
-    for(i = 0; i < NumPart; i++)
-    {
-        if((TimeBinActive[P[i].TimeBin]) || (P[i].Type==0)) /* active OR gas, need to check each timestep to ensure manifest conservation */
-#else
-    for (int _apl = 0; _apl < (int)ActiveParticleList.size(); _apl++) /* 'full' kick for active particles */
-    { int i = ActiveParticleList[_apl];
-#endif
+        for(i = 0; i < NumPart; i++)
         {
-            if(P[i].Mass > 0)
+            if((TimeBinActive[P[i].TimeBin]) || (P[i].Type==0)) /* active OR gas, need to check each timestep to ensure manifest conservation */
+#else
+        for (int _apl = 0; _apl < (int)ActiveParticleList.size(); _apl++) /* 'full' kick for active particles */
+        { int i = ActiveParticleList[_apl];
+#endif
             {
-                ti_step = P[i].integertime_step();
-                tstart = P[i].Ti_begstep + ti_step / 2;	/* midpoint of step */
-                tend = P[i].Ti_begstep + ti_step;	/* end of step */
-                do_the_kick(i, tstart, tend, P[i].Ti_current, 1);
-                set_predicted_quantities_for_extra_physics(i);
+                if(P[i].Mass > 0)
+                {
+                    ti_step = P[i].integertime_step();
+                    tstart = P[i].Ti_begstep + ti_step / 2;	/* midpoint of step */
+                    tend = P[i].Ti_begstep + ti_step;	/* end of step */
+                    do_the_kick(i, tstart, tend, P[i].Ti_current, 1);
+                    set_predicted_quantities_for_extra_physics(i);
+                }
             }
-        }
-    } // for(i = 0; i < NumPart; i++) //
+        } // for(i = 0; i < NumPart; i++) //
+    }
+
 #if defined(CBE_INTEGRATOR)
     /* Resync predicted CBE state to conserved AFTER the gravity half-kick. The
      * CBE kick (above, before gravity) reset pred=conserved in the pre-gravity
@@ -179,6 +190,7 @@ static void mark_hermite_positions_written(void)
 // Note: the below routines only account for gravitational acceleration - only appropriate for stars or collisionless particles
 void do_hermite_prediction(void)
 {
+    GIZMO_TIMER_FUNCTION();
     int i; integertime ti_step, tstart=0, tend=0;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) private(ti_step, tstart, tend)
@@ -207,6 +219,7 @@ void do_hermite_prediction(void)
 
 void do_hermite_correction(void) // corrector step
 {
+    GIZMO_TIMER_FUNCTION();
     int i; integertime ti_step, tstart=0, tend=0;
     int gas_corrected = 0; /* the corrector writes positions, which the kept gas neighbour index must see */
 #ifdef _OPENMP
@@ -241,6 +254,7 @@ void do_hermite_correction(void) // corrector step
 #ifdef PMGRID
 void apply_long_range_kick(integertime tstart, integertime tend)
 {
+    GIZMO_TIMER_FUNCTION();
     int i;
     double dt_gravkick = get_gravkick_factor(tstart, tend, -1, 0);
 #ifdef _OPENMP

@@ -102,6 +102,7 @@ static std::vector<unsigned char> TreeforceCandidateFrozen;
 
 void gravity_freeze_treeforce_candidates(void)
 {
+    GIZMO_TIMER_FUNCTION();
     TreeforceCandidateFrozen.assign(ActiveParticleList.size(), 0);
     for(int ii = 0; ii < (int)ActiveParticleList.size(); ii++)
     {
@@ -118,6 +119,7 @@ int gravity_treeforce_candidate_frozen(int ii)
 
 void refresh_old_acceleration_for_tree_opening(void)
 {
+    GIZMO_TIMER_FUNCTION();
     /* OldAcc is overloaded on a 2lpt start: the IC reader leaves the particle masses in it, and
      * init.cc deliberately does not zero it for that reason.  Nothing has been staged yet either,
      * so promoting here would replace those masses with zeros before the first evaluation is done
@@ -232,7 +234,10 @@ void gravity_tree(void)
        stale moments produce wrong forces. Much cheaper than a full treebuild. */
     {
         int TreeMomentsStaleFlag_global;
-        MPI_Allreduce(&TreeMomentsStaleFlag, &TreeMomentsStaleFlag_global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce_stale_moments");
+            MPI_Allreduce(&TreeMomentsStaleFlag, &TreeMomentsStaleFlag_global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        }
         if(TreeMomentsStaleFlag_global)
         {
             CPU_Step[CPU_MISC] += measure_time();
@@ -345,17 +350,21 @@ gravity_walk_attempt:
             iter++;
             BufferFullFlag = 0; Nexport = 0; tstart = my_second();
 
+            {
+                GIZMO_TIMER_SCOPE("host_gravity_walk");
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-            {
+                {
 #ifdef _OPENMP
-                int mainthreadid = omp_get_thread_num();
+                    int mainthreadid = omp_get_thread_num();
 #else
-                int mainthreadid = 0;
+                    int mainthreadid = 0;
 #endif
-                gravity_primary_loop(&mainthreadid);	/* do local particles and prepare export list */
+                    gravity_primary_loop(&mainthreadid);	/* do local particles and prepare export list */
+                }
             }
+
             tend = my_second(); timetree1 += timediff(tstart, tend);
 
             /* ============================================================
@@ -404,7 +413,10 @@ gravity_walk_attempt:
              * cargo-cult invalidate. */
             if(NextParticle >= (int)ActiveParticleList.size()) {ndone_flag = 1;} else {ndone_flag = 0;} /* figure out if we are done with the particular active set here */
             tstart = my_second();
-            MPI_Allreduce(&ndone_flag, &ndone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD); /* call an allreduce to figure out if all tasks are also done here, otherwise we need to iterate */
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce_walk_completion");
+                MPI_Allreduce(&ndone_flag, &ndone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            } /* call an allreduce to figure out if all tasks are also done here, otherwise we need to iterate */
             tend = my_second(); timewait2 += timediff(tstart, tend);
             gizmo_exit_bad_stop_if_requested("gravtree:tree_export_loop"); /* drain a buffer-too-small bad-stop here instead of retrying the export with zero progress */
         }
@@ -421,7 +433,10 @@ gravity_walk_attempt:
         long long unshippable_local = gravity_unshippable_import_count();
         long long tally[3] = {shortfall_local, (shortfall_local > 0) ? 1 : 0, unshippable_local};
         long long total[3] = {0, 0, 0};
-        MPI_Allreduce(tally, total, 3, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(tally, total, 3, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        }
         if(total[0] > 0)
         {
             /* A shortfall is worth a rebuild only if a rebuild could answer it.  Where the walk
@@ -438,7 +453,10 @@ gravity_walk_attempt:
             char example[256]; example[0] = '\0';
             int have = gravity_incomplete_import_example(example, (int) sizeof(example));
             int pick[2] = {have ? ThisTask : NTask, ThisTask}, chosen[2] = {NTask, 0};
-            MPI_Allreduce(pick, chosen, 1, MPI_2INT, MPI_MINLOC, MPI_COMM_WORLD);
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                MPI_Allreduce(pick, chosen, 1, MPI_2INT, MPI_MINLOC, MPI_COMM_WORLD);
+            }
             if(chosen[0] < NTask) {MPI_Bcast(example, (int) sizeof(example), MPI_CHAR, chosen[0], MPI_COMM_WORLD);}
             else {example[0] = '\0';}
             if(ThisTask == 0)
@@ -759,14 +777,38 @@ gravity_walk_attempt:
     /* Now the force computation is finished: gather timing and diagnostic information */
     t1 = my_second(); cpu_chain_sync(t1); timeall = cpu_minus_children(timediff(t0, t1), child0_span);
     timetree = timetree1 + timetree2; timewait = timewait1 + timewait2; timecomm = timecommsumm1 + timecommsumm2;
-    MPI_Reduce(&timetree, &sumt, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timetree, &maxt, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timetree1, &sumt1, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timetree1, &maxt1, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timetree2, &sumt2, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timetree2, &maxt2, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timewait, &sumwaitall, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&timecomm, &sumcommall, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree, &sumt, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree, &maxt, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree1, &sumt1, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree1, &maxt1, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree2, &sumt2, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timetree2, &maxt2, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timewait, &sumwaitall, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&timecomm, &sumcommall, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
     /* The interaction total the walks recorded into GravWork rides the same reduction as Costtotal, for
      * the consistency check below, so it adds no collective to the call. */
     double sum_costtotal_new = 0;
@@ -775,15 +817,24 @@ gravity_walk_attempt:
 #ifndef SELFGRAVITY_OFF
         for(size_t ii = 0; ii < ActiveParticleList.size(); ii++) {costtotal_pair[1] += (double) P[ActiveParticleList[ii]].GravWork - (double) grav_work_at_call_start[ii];}
 #endif
-        MPI_Reduce(costtotal_pair, sum_costtotal_pair, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+            MPI_Reduce(costtotal_pair, sum_costtotal_pair, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        }
         sum_costtotal = sum_costtotal_pair[0]; sum_costtotal_new = sum_costtotal_pair[1];
     }
-    MPI_Reduce(&Ewaldcount, &ewaldtot, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&Ewaldcount, &ewaldtot, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
     sumup_longs(1, &n_exported, &n_exported);
     sumup_longs(1, &N_nodesinlist, &N_nodesinlist);
     All.TotNumOfForces += GlobNumForceUpdate;
     plb = (NumPart / ((double) All.TotNumPart)) * NTask;
-    MPI_Reduce(&plb, &plb_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&plb, &plb_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
     /* Packets the device engine gave up on this call, by reason, summed over ranks and also taken
      * at its worst rank: a budget cliff is a property of the rank with the divergent subtree, and
      * a sum over ranks alone would average it away.  Collective, so it sits with the other
@@ -820,9 +871,18 @@ gravity_walk_attempt:
         else if(ps_local.mode == GRAV_PACKET_MODE_COOPERATIVE) {packet_fail[mode_base + 2] = 1;}
         if(ps_local.mode == GRAV_PACKET_MODE_FLAT && ps_local.team == 0 && ps_local.team_max >= 0) {packet_fail[mode_base + 3] = 1;}
     }
-    MPI_Reduce(packet_fail, packet_fail_sum, report_slots, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(packet_fail, packet_fail_max, report_slots, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&Numnodestree, &maxnumnodes, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(packet_fail, packet_fail_sum, report_slots, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(packet_fail, packet_fail_max, report_slots, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
+    {
+        GIZMO_TIMER_SCOPE("MPI_Reduce_walk_statistics");
+        MPI_Reduce(&Numnodestree, &maxnumnodes, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
     /* The span from the end of the build to here is the force walk.  Only the
      * wait is separately measured inside it, so the walk row is the rest of the
      * span; charging the remainder to `misc` instead reported the whole walk as

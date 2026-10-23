@@ -10,6 +10,7 @@
  *
  * Written by Phil Hopkins (phopkins@caltech.edu) for GIZMO.
  */
+#include "../system/timer.h"
 
 #include <mpi.h>
 #include <stdio.h>
@@ -224,6 +225,7 @@ static int topo_acquire_(int npart, const struct unbind_data *mp, const char *si
 
 extern "C" int gpu_topology_build_data_path(int npart, const struct unbind_data *mp)
 {
+    GIZMO_TIMER_FUNCTION();
     if(npart <= 0) {g_slot_map_active = 0; return 0;}
     struct topo_build_ctx ctx;
     int rc = topo_acquire_(npart, mp, "gpu_topology_build_data_path", &ctx);
@@ -254,16 +256,19 @@ extern "C" int gpu_topology_build_data_path(int npart, const struct unbind_data 
      * the standing tree they were recovered from no longer exists. */
     const int *stp = g_slot_map_active ? g_slot_to_particle : NULL;
     if(!(mp == NULL && g_prepared_npart == npart)) {
-        Kokkos::parallel_for("topo_keys_and_assign", npart, KOKKOS_LAMBDA(int i) {
-            int real = stp ? stp[i] : i;
-            Morton128 m;
-            peanokey pkey = topo_key_of_position_(P_dev[real].Pos[0], P_dev[real].Pos[1], P_dev[real].Pos[2],
-                                                  dc0, dc1, dc2, dlen, bits, &m);
-            keys[i] = m;
-            pt[i] = gpu_topleaf_for_key(tn, pkey);
-        });
-        Kokkos::fence();
-        gizmo_gpu_check_last_error("topo_keys_and_assign", npart);
+        {
+            GIZMO_TIMER_SCOPE("topo_keys_and_assign");
+            Kokkos::parallel_for("topo_keys_and_assign", npart, KOKKOS_LAMBDA(int i) {
+                int real = stp ? stp[i] : i;
+                Morton128 m;
+                peanokey pkey = topo_key_of_position_(P_dev[real].Pos[0], P_dev[real].Pos[1], P_dev[real].Pos[2],
+                                                      dc0, dc1, dc2, dlen, bits, &m);
+                keys[i] = m;
+                pt[i] = gpu_topleaf_for_key(tn, pkey);
+            });
+            Kokkos::fence();
+            gizmo_gpu_check_last_error("topo_keys_and_assign", npart);
+        }
     }
 
     /* Retained attachment: a particle kept under the topleaf it hung from in the standing tree takes
@@ -295,68 +300,71 @@ extern "C" int gpu_topology_build_data_path(int npart, const struct unbind_data 
         int *bad = (int *) gizmo_gpu_alloc_shared(4 * sizeof(int), "treescratch_build_ctr");
         if(!bad) {printf("gpu_topology_build: retained clamp counter alloc failed\n"); return 1;}
         bad[0] = 0; bad[1] = 0; bad[2] = -1; bad[3] = -1;
-        Kokkos::parallel_for("topo_retained_clamp", nret, KOKKOS_LAMBDA(int j) {
-            int i = ret[j];
-            int leaf = pt[i];
-            int nd = (leaf >= 0 && leaf < ntl) ? dni[leaf] : -1;
-            if(nd < tbase || nd >= tbase + maxn) {
-                if(Kokkos::atomic_fetch_add(&bad[1], 1) == 0) {bad[2] = leaf; bad[3] = nd;}
-                return;
-            }
-            Vec3<double> sep = {(double)P_dev[i].Pos[0] - (double)Nodes_uvm[nd].center[0],
-                                (double)P_dev[i].Pos[1] - (double)Nodes_uvm[nd].center[1],
-                                (double)P_dev[i].Pos[2] - (double)Nodes_uvm[nd].center[2]};
-            nearest_xyz(sep, -1);
-            double inner = 0.5 * (double)Nodes_uvm[nd].len - clamp_backoff;
-            if(!(inner > 0.0)) {inner = 0.0;}   /* a leaf narrower than the margin: the centre is inside */
-            /* Clamping each axis on its own sends every particle that lies outside ALL THREE faces
-             * to the same interior corner (+-inner, +-inner, +-inner), so an arbitrary number of
-             * them collapse onto one point and take an IDENTICAL key.  The range then looks
-             * perfectly collocated to the builder when the particles are nowhere near each other:
-             * the split finds one occupied child, the node cannot subdivide, and the chain descends
-             * a level at a time burning a node per level until the softening floor hands it to the
-             * randomized path.  Scaling the whole separation instead keeps the direction, so those
-             * particles land on distinct points of the face and sort apart as they should.
-             *
-             * Two saturated axes collapse the same way whenever the third coordinate is shared --
-             * the pair goes to (+-inner, +-inner) and only the unshared axis could have told them
-             * apart.  So the projection runs whenever at least two axes saturate, over just those
-             * axes: the saturated components are scaled by the largest of themselves, which lands
-             * that one on the face and the rest inside, while every unsaturated component is left
-             * exactly as it was.  With three saturated axes this is the same arithmetic as before.
-             *
-             * One saturated axis is NOT covered and cannot be by this means: with a single
-             * component to scale, every particle on that side of the face still maps to +-inner,
-             * and a population sharing the other two coordinates -- a line -- still collapses.
-             * That case needs the other two coordinates to differ, which is what the common
-             * crossing has. */
-            const double ax = fabs(sep[0]), ay = fabs(sep[1]), az = fabs(sep[2]);
-            const int sat0 = (ax > inner), sat1 = (ay > inner), sat2 = (az > inner);
-            if(sat0 + sat1 + sat2 >= 2) {
-                double mx = 0.0;
-                if(sat0 && ax > mx) {mx = ax;}
-                if(sat1 && ay > mx) {mx = ay;}
-                if(sat2 && az > mx) {mx = az;}
-                const double scale = (mx > 0.0) ? (inner / mx) : 0.0;
-                if(sat0) {sep[0] *= scale;}
-                if(sat1) {sep[1] *= scale;}
-                if(sat2) {sep[2] *= scale;}
-            } else {
-                for(int d = 0; d < 3; d++) {
-                    if(sep[d] >  inner) {sep[d] =  inner;}
-                    if(sep[d] < -inner) {sep[d] = -inner;}
+        {
+            GIZMO_TIMER_SCOPE("topo_retained_clamp");
+            Kokkos::parallel_for("topo_retained_clamp", nret, KOKKOS_LAMBDA(int j) {
+                int i = ret[j];
+                int leaf = pt[i];
+                int nd = (leaf >= 0 && leaf < ntl) ? dni[leaf] : -1;
+                if(nd < tbase || nd >= tbase + maxn) {
+                    if(Kokkos::atomic_fetch_add(&bad[1], 1) == 0) {bad[2] = leaf; bad[3] = nd;}
+                    return;
                 }
-            }
-            Morton128 m;
-            peanokey pkey = topo_key_of_position_((double)Nodes_uvm[nd].center[0] + sep[0],
-                                                  (double)Nodes_uvm[nd].center[1] + sep[1],
-                                                  (double)Nodes_uvm[nd].center[2] + sep[2],
-                                                  dc0, dc1, dc2, dlen, bits, &m);
-            keys[i] = m;
-            if(gpu_topleaf_for_key(tn, pkey) != leaf) {Kokkos::atomic_fetch_add(&bad[0], 1);}
-        });
-        Kokkos::fence();
-        gizmo_gpu_check_last_error("topo_retained_clamp", nret);
+                Vec3<double> sep = {(double)P_dev[i].Pos[0] - (double)Nodes_uvm[nd].center[0],
+                                    (double)P_dev[i].Pos[1] - (double)Nodes_uvm[nd].center[1],
+                                    (double)P_dev[i].Pos[2] - (double)Nodes_uvm[nd].center[2]};
+                nearest_xyz(sep, -1);
+                double inner = 0.5 * (double)Nodes_uvm[nd].len - clamp_backoff;
+                if(!(inner > 0.0)) {inner = 0.0;}   /* a leaf narrower than the margin: the centre is inside */
+                /* Clamping each axis on its own sends every particle that lies outside ALL THREE faces
+                 * to the same interior corner (+-inner, +-inner, +-inner), so an arbitrary number of
+                 * them collapse onto one point and take an IDENTICAL key.  The range then looks
+                 * perfectly collocated to the builder when the particles are nowhere near each other:
+                 * the split finds one occupied child, the node cannot subdivide, and the chain descends
+                 * a level at a time burning a node per level until the softening floor hands it to the
+                 * randomized path.  Scaling the whole separation instead keeps the direction, so those
+                 * particles land on distinct points of the face and sort apart as they should.
+                 *
+                 * Two saturated axes collapse the same way whenever the third coordinate is shared --
+                 * the pair goes to (+-inner, +-inner) and only the unshared axis could have told them
+                 * apart.  So the projection runs whenever at least two axes saturate, over just those
+                 * axes: the saturated components are scaled by the largest of themselves, which lands
+                 * that one on the face and the rest inside, while every unsaturated component is left
+                 * exactly as it was.  With three saturated axes this is the same arithmetic as before.
+                 *
+                 * One saturated axis is NOT covered and cannot be by this means: with a single
+                 * component to scale, every particle on that side of the face still maps to +-inner,
+                 * and a population sharing the other two coordinates -- a line -- still collapses.
+                 * That case needs the other two coordinates to differ, which is what the common
+                 * crossing has. */
+                const double ax = fabs(sep[0]), ay = fabs(sep[1]), az = fabs(sep[2]);
+                const int sat0 = (ax > inner), sat1 = (ay > inner), sat2 = (az > inner);
+                if(sat0 + sat1 + sat2 >= 2) {
+                    double mx = 0.0;
+                    if(sat0 && ax > mx) {mx = ax;}
+                    if(sat1 && ay > mx) {mx = ay;}
+                    if(sat2 && az > mx) {mx = az;}
+                    const double scale = (mx > 0.0) ? (inner / mx) : 0.0;
+                    if(sat0) {sep[0] *= scale;}
+                    if(sat1) {sep[1] *= scale;}
+                    if(sat2) {sep[2] *= scale;}
+                } else {
+                    for(int d = 0; d < 3; d++) {
+                        if(sep[d] >  inner) {sep[d] =  inner;}
+                        if(sep[d] < -inner) {sep[d] = -inner;}
+                    }
+                }
+                Morton128 m;
+                peanokey pkey = topo_key_of_position_((double)Nodes_uvm[nd].center[0] + sep[0],
+                                                      (double)Nodes_uvm[nd].center[1] + sep[1],
+                                                      (double)Nodes_uvm[nd].center[2] + sep[2],
+                                                      dc0, dc1, dc2, dlen, bits, &m);
+                keys[i] = m;
+                if(gpu_topleaf_for_key(tn, pkey) != leaf) {Kokkos::atomic_fetch_add(&bad[0], 1);}
+            });
+            Kokkos::fence();
+            gizmo_gpu_check_last_error("topo_retained_clamp", nret);
+        }
         int nbad = bad[0], nbadnode = bad[1], badleaf = bad[2], badnode = bad[3];
         Kokkos::kokkos_free<GIZMO_KOKKOS_SHARED_SPACE>(bad);
         if(nbadnode) {
@@ -380,56 +388,74 @@ extern "C" int gpu_topology_build_data_path(int npart, const struct unbind_data 
     /* Bucket counts, taken from the final topleaf assignment rather than fused into the
      * kernel above: a retained attachment changes which bucket a particle belongs to
      * after its key has been computed. */
-    Kokkos::parallel_for("topo_zero_counts", ntl, KOKKOS_LAMBDA(int t) {
-        tcnt[t] = 0;
-        tcur[t] = 0;
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_zero_counts", ntl);
+    {
+        GIZMO_TIMER_SCOPE("topo_zero_counts");
+        Kokkos::parallel_for("topo_zero_counts", ntl, KOKKOS_LAMBDA(int t) {
+            tcnt[t] = 0;
+            tcur[t] = 0;
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_zero_counts", ntl);
+    }
 
-    Kokkos::parallel_for("topo_count_buckets", npart, KOKKOS_LAMBDA(int i) {
-        Kokkos::atomic_fetch_add(&tcnt[pt[i]], 1);
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_count_buckets", npart);
+    {
+        GIZMO_TIMER_SCOPE("topo_count_buckets");
+        Kokkos::parallel_for("topo_count_buckets", npart, KOKKOS_LAMBDA(int i) {
+            Kokkos::atomic_fetch_add(&tcnt[pt[i]], 1);
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_count_buckets", npart);
+    }
 
     /* Kernel 2: exclusive prefix scan to compute topleaf_start[]. */
-    Kokkos::parallel_scan("topo_scan", ntl,
-        KOKKOS_LAMBDA(int t, int &acc, bool final_pass) {
-            int c = tcnt[t];
-            if(final_pass) {tsta[t] = acc;}
-            acc += c;
-        });
-    Kokkos::fence();
+    {
+        GIZMO_TIMER_SCOPE("topo_scan");
+        Kokkos::parallel_scan("topo_scan", ntl,
+            KOKKOS_LAMBDA(int t, int &acc, bool final_pass) {
+                int c = tcnt[t];
+                if(final_pass) {tsta[t] = acc;}
+                acc += c;
+            });
+        Kokkos::fence();
+    }
     /* Sentinel: tsta[NTopleaves] = total particle count. */
-    Kokkos::parallel_for("topo_scan_sentinel", 1, KOKKOS_LAMBDA(int /*unused*/) {
-        int total = 0;
-        for(int t = 0; t < ntl; t++) {total += tcnt[t];}
-        tsta[ntl] = total;
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_scan_sentinel", 1);
+    {
+        GIZMO_TIMER_SCOPE("topo_scan_sentinel");
+        Kokkos::parallel_for("topo_scan_sentinel", 1, KOKKOS_LAMBDA(int /*unused*/) {
+            int total = 0;
+            for(int t = 0; t < ntl; t++) {total += tcnt[t];}
+            tsta[ntl] = total;
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_scan_sentinel", 1);
+    }
 
     /* Kernel 3: scatter -- each particle takes its slot in its topleaf's
      * range via atomic_fetch_add into tcur[]. */
-    Kokkos::parallel_for("topo_scatter", npart, KOKKOS_LAMBDA(int i) {
-        int leaf = pt[i];
-        int slot = Kokkos::atomic_fetch_add(&tcur[leaf], 1);
-        sidx[tsta[leaf] + slot] = i;
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_scatter", npart);
+    {
+        GIZMO_TIMER_SCOPE("topo_scatter");
+        Kokkos::parallel_for("topo_scatter", npart, KOKKOS_LAMBDA(int i) {
+            int leaf = pt[i];
+            int slot = Kokkos::atomic_fetch_add(&tcur[leaf], 1);
+            sidx[tsta[leaf] + slot] = i;
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_scatter", npart);
+    }
 
     /* Kernel 4 (per-topleaf sort): host loop over topleaves, dispatching
      * one Morton sort per range.  NTopleaves is typically O(100); each
      * sort is small.  Future optimization: parallel team-policy sort,
      * but correctness-first here. */
-    for(int t = 0; t < ntl; t++) {
-        int start = g_topleaf_start[t];
-        int count = g_topleaf_count[t];
-        if(count > 1) {
-            int rc2 = gpu_morton_sort_indices(count, g_sorted_idx + start);
-            if(rc2) {return rc2;}
+    {
+        GIZMO_TIMER_SCOPE("sort_topleaf_morton_ranges");
+        for(int t = 0; t < ntl; t++) {
+            int start = g_topleaf_start[t];
+            int count = g_topleaf_count[t];
+            if(count > 1) {
+                int rc2 = gpu_morton_sort_indices(count, g_sorted_idx + start);
+                if(rc2) {return rc2;}
+            }
         }
     }
 
@@ -455,6 +481,7 @@ extern "C" int gpu_topology_prepare_retained_attachment(int npart, int topology_
                                                         long *n_crossed_out, long *n_unrecovered_out,
                                                         long *n_outside_extent_out)
 {
+    GIZMO_TIMER_FUNCTION();
     if(n_crossed_out)     {*n_crossed_out = 0;}
     if(n_unrecovered_out) {*n_unrecovered_out = 0;}
     if(n_outside_extent_out) {*n_outside_extent_out = 0;}
@@ -490,38 +517,41 @@ extern "C" int gpu_topology_prepare_retained_attachment(int npart, int topology_
     if(!ctr) {printf("gpu_topology_build: retained counter alloc failed\n"); return 1;}
     ctr[0] = 0; ctr[1] = 0; ctr[2] = 0;
 
-    Kokkos::parallel_for("topo_keys_and_assign", npart, KOKKOS_LAMBDA(int i) {
-        /* Tested before the key is formed: outside the extent the key would name another cell. */
-        if(position_outside_domain_extent(P_dev[i].Pos[0], P_dev[i].Pos[1], P_dev[i].Pos[2], dc0, dc1, dc2, dlen))
-            {Kokkos::atomic_fetch_add(&ctr[2], 1); return;}
-        Morton128 m;
-        peanokey pkey = topo_key_of_position_(P_dev[i].Pos[0], P_dev[i].Pos[1], P_dev[i].Pos[2],
-                                              dc0, dc1, dc2, dlen, bits, &m);
-        keys[i] = m;
-        int leaf = gpu_topleaf_for_key(tn, pkey);
-        pt[i] = leaf;
-        if(leaf < 0 || leaf >= ntl || dtask[leaf] == me) {return;}   /* the fast path: this rank owns it */
-        stage[Kokkos::atomic_fetch_add(&ctr[0], 1)] = i;
-        if(!use_standing_tree) {return;}
-        int f = father[i];
-        if(f < tbase || f >= tbase + maxn) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
-        Morton128 mf;
-        peanokey fkey = topo_key_of_position_((double)Nodes_uvm[f].center[0],
-                                              (double)Nodes_uvm[f].center[1],
-                                              (double)Nodes_uvm[f].center[2],
-                                              dc0, dc1, dc2, dlen, bits, &mf);
-        int retained = gpu_topleaf_for_key(tn, fkey);
-        if(retained < 0 || retained >= ntl || dtask[retained] != me) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
-        /* The leaf has to have a node in this tree before anything is attached to it: the clamp that
-         * follows, and the growth pass after the build, both index Nodes[] with exactly this value.
-         * An attachment naming a leaf whose node lies outside the tree is not usable, so it is
-         * reported with the others that cannot be recovered rather than retained. */
-        const int retained_node = dni[retained];
-        if(retained_node < tbase || retained_node >= tbase + maxn) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
-        pt[i] = retained;
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_keys_and_assign", npart);
+    {
+        GIZMO_TIMER_SCOPE("topo_keys_and_assign");
+        Kokkos::parallel_for("topo_keys_and_assign", npart, KOKKOS_LAMBDA(int i) {
+            /* Tested before the key is formed: outside the extent the key would name another cell. */
+            if(position_outside_domain_extent(P_dev[i].Pos[0], P_dev[i].Pos[1], P_dev[i].Pos[2], dc0, dc1, dc2, dlen))
+                {Kokkos::atomic_fetch_add(&ctr[2], 1); return;}
+            Morton128 m;
+            peanokey pkey = topo_key_of_position_(P_dev[i].Pos[0], P_dev[i].Pos[1], P_dev[i].Pos[2],
+                                                  dc0, dc1, dc2, dlen, bits, &m);
+            keys[i] = m;
+            int leaf = gpu_topleaf_for_key(tn, pkey);
+            pt[i] = leaf;
+            if(leaf < 0 || leaf >= ntl || dtask[leaf] == me) {return;}   /* the fast path: this rank owns it */
+            stage[Kokkos::atomic_fetch_add(&ctr[0], 1)] = i;
+            if(!use_standing_tree) {return;}
+            int f = father[i];
+            if(f < tbase || f >= tbase + maxn) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
+            Morton128 mf;
+            peanokey fkey = topo_key_of_position_((double)Nodes_uvm[f].center[0],
+                                                  (double)Nodes_uvm[f].center[1],
+                                                  (double)Nodes_uvm[f].center[2],
+                                                  dc0, dc1, dc2, dlen, bits, &mf);
+            int retained = gpu_topleaf_for_key(tn, fkey);
+            if(retained < 0 || retained >= ntl || dtask[retained] != me) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
+            /* The leaf has to have a node in this tree before anything is attached to it: the clamp that
+             * follows, and the growth pass after the build, both index Nodes[] with exactly this value.
+             * An attachment naming a leaf whose node lies outside the tree is not usable, so it is
+             * reported with the others that cannot be recovered rather than retained. */
+            const int retained_node = dni[retained];
+            if(retained_node < tbase || retained_node >= tbase + maxn) {Kokkos::atomic_fetch_add(&ctr[1], 1); return;}
+            pt[i] = retained;
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_keys_and_assign", npart);
+    }
 
     int n_crossed = ctr[0], n_unrecovered = ctr[1], n_outside_extent = ctr[2];
     Kokkos::kokkos_free<GIZMO_KOKKOS_SHARED_SPACE>(ctr);
@@ -562,6 +592,7 @@ extern "C" void gpu_topology_forget_prepared(void)
  * build-time suns layout at this point. */
 extern "C" int gpu_topology_grow_retained_paths(void)
 {
+    GIZMO_TIMER_FUNCTION();
     if(g_retained_n <= 0) {return 0;}
     GIZMO_GPU_ENSURE_ALL_FRESH();
 
@@ -589,40 +620,43 @@ extern "C" int gpu_topology_grow_retained_paths(void)
     if(!unreached) {printf("gpu_topology_grow_retained_paths: counter alloc failed\n"); return 1;}
     *unreached = 0;
 
-    Kokkos::parallel_for("topo_retained_grow", nret, KOKKOS_LAMBDA(int j) {
-        int i = ret[j];
-        /* Same index, same reason as the clamp: bound the leaf before reading the map. */
-        const int lf = pt[i];
-        int leaf_node = (lf >= 0 && lf < ntl) ? dni[lf] : -1;
-        int no = father[i];
-        volatile int reached_leaf = 0;
-        for(int guard = 0; guard < GIZMO_GPU_MORTON_MAX_DEPTH + 8; guard++) {
-            if(no < tbase || no >= tbase + maxn) {break;}
-            Vec3<double> sep = {(double)P_dev[i].Pos[0] - (double)Nodes_uvm[no].center[0],
-                                (double)P_dev[i].Pos[1] - (double)Nodes_uvm[no].center[1],
-                                (double)P_dev[i].Pos[2] - (double)Nodes_uvm[no].center[2]};
-            nearest_xyz(sep, -1);
-            double reach = fabs(sep[0]);
-            if(fabs(sep[1]) > reach) {reach = fabs(sep[1]);}
-            if(fabs(sep[2]) > reach) {reach = fabs(sep[2]);}
-            /* Unconditional: several retained particles can share a node, so reading the length
-             * first to decide whether to raise it would be a plain load racing with their atomic
-             * writes.  The maximum is already a no-op when the node is wide enough, and this path
-             * only runs for particles that crossed a top-leaf boundary. */
-            const MyFloat need = (MyFloat)(2.0 * reach);
-            Kokkos::atomic_max(&Nodes_uvm[no].len,   need);
-            Kokkos::atomic_max(&soa_len[no - tbase], need);
-            if(no == leaf_node) {reached_leaf = 1; break;}
-            no = soa_father[no - tbase];
-        }
-        /* The retained top-leaf is an ancestor of this particle's node by construction, so failing to
-         * arrive at it means the node chain is not what the build just emitted.  It matters because
-         * that leaf is the one whose length is exchanged: left ungrown, every other rank would bound
-         * it by its nominal cube while it holds a particle outside. */
-        if(!reached_leaf) {Kokkos::atomic_fetch_add(unreached, 1);}
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_retained_grow", nret);
+    {
+        GIZMO_TIMER_SCOPE("topo_retained_grow");
+        Kokkos::parallel_for("topo_retained_grow", nret, KOKKOS_LAMBDA(int j) {
+            int i = ret[j];
+            /* Same index, same reason as the clamp: bound the leaf before reading the map. */
+            const int lf = pt[i];
+            int leaf_node = (lf >= 0 && lf < ntl) ? dni[lf] : -1;
+            int no = father[i];
+            volatile int reached_leaf = 0;
+            for(int guard = 0; guard < GIZMO_GPU_MORTON_MAX_DEPTH + 8; guard++) {
+                if(no < tbase || no >= tbase + maxn) {break;}
+                Vec3<double> sep = {(double)P_dev[i].Pos[0] - (double)Nodes_uvm[no].center[0],
+                                    (double)P_dev[i].Pos[1] - (double)Nodes_uvm[no].center[1],
+                                    (double)P_dev[i].Pos[2] - (double)Nodes_uvm[no].center[2]};
+                nearest_xyz(sep, -1);
+                double reach = fabs(sep[0]);
+                if(fabs(sep[1]) > reach) {reach = fabs(sep[1]);}
+                if(fabs(sep[2]) > reach) {reach = fabs(sep[2]);}
+                /* Unconditional: several retained particles can share a node, so reading the length
+                 * first to decide whether to raise it would be a plain load racing with their atomic
+                 * writes.  The maximum is already a no-op when the node is wide enough, and this path
+                 * only runs for particles that crossed a top-leaf boundary. */
+                const MyFloat need = (MyFloat)(2.0 * reach);
+                Kokkos::atomic_max(&Nodes_uvm[no].len,   need);
+                Kokkos::atomic_max(&soa_len[no - tbase], need);
+                if(no == leaf_node) {reached_leaf = 1; break;}
+                no = soa_father[no - tbase];
+            }
+            /* The retained top-leaf is an ancestor of this particle's node by construction, so failing to
+             * arrive at it means the node chain is not what the build just emitted.  It matters because
+             * that leaf is the one whose length is exchanged: left ungrown, every other rank would bound
+             * it by its nominal cube while it holds a particle outside. */
+            if(!reached_leaf) {Kokkos::atomic_fetch_add(unreached, 1);}
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_retained_grow", nret);
+    }
     const int n_unreached = *unreached;
     Kokkos::kokkos_free<GIZMO_KOKKOS_SHARED_SPACE>(unreached);
     if(n_unreached) {
@@ -651,6 +685,7 @@ struct BfsItem {
 
 extern "C" int gpu_topology_emit_bfs(int start_node_index, int *new_node_count_out)
 {
+    GIZMO_TIMER_FUNCTION();
     GIZMO_GPU_ENSURE_ALL_FRESH();
     if(new_node_count_out) {*new_node_count_out = start_node_index;}
 
@@ -760,32 +795,35 @@ extern "C" int gpu_topology_emit_bfs(int start_node_index, int *new_node_count_o
     /* Initial population: for each topleaf with >= 1 particle, push a
      * BfsItem.  Compute parent_depth from the topleaf's len. */
     const double dlen = DomainLen;
-    Kokkos::parallel_for("topo_bfs_init", ntl, KOKKOS_LAMBDA(int t) {
-        int count = tcnt[t];
-        if(count < 1) {return;}
-        int parent_abs = dni[t];
-        int parent_soa = parent_abs - tree_base;
-        if(parent_soa < 0 || parent_soa >= max_nodes) {return;}
+    {
+        GIZMO_TIMER_SCOPE("topo_bfs_init");
+        Kokkos::parallel_for("topo_bfs_init", ntl, KOKKOS_LAMBDA(int t) {
+            int count = tcnt[t];
+            if(count < 1) {return;}
+            int parent_abs = dni[t];
+            int parent_soa = parent_abs - tree_base;
+            if(parent_soa < 0 || parent_soa >= max_nodes) {return;}
 
-        /* Topleaf depth = log2(DomainLen / topleaf_len), exact integer. */
-        double len_d = (double)soa_len[parent_soa];
-        int depth = 0;
-        if(len_d > 0.0) {
-            double r = dlen / len_d;
-            while(r > 1.5 && depth < 64) {depth++; r *= 0.5;}
-        }
+            /* Topleaf depth = log2(DomainLen / topleaf_len), exact integer. */
+            double len_d = (double)soa_len[parent_soa];
+            int depth = 0;
+            if(len_d > 0.0) {
+                double r = dlen / len_d;
+                while(r > 1.5 && depth < 64) {depth++; r *= 0.5;}
+            }
 
-        BfsItem w;
-        w.parent_soa   = parent_soa;
-        w.range_first  = tsta[t];
-        w.range_last   = tsta[t] + count;
-        w.parent_depth = depth;
-        int slot = Kokkos::atomic_fetch_add(sz_curr, 1);
-        if(slot < max_nodes) {wl_a(slot) = w;}
-        else {Kokkos::atomic_fetch_max(fail, 1);}
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_bfs_init", ntl);
+            BfsItem w;
+            w.parent_soa   = parent_soa;
+            w.range_first  = tsta[t];
+            w.range_last   = tsta[t] + count;
+            w.parent_depth = depth;
+            int slot = Kokkos::atomic_fetch_add(sz_curr, 1);
+            if(slot < max_nodes) {wl_a(slot) = w;}
+            else {Kokkos::atomic_fetch_max(fail, 1);}
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_bfs_init", ntl);
+    }
 
     if(*fail) {
         Kokkos::kokkos_free<GIZMO_KOKKOS_SHARED_SPACE>(sz_curr);
@@ -805,149 +843,152 @@ extern "C" int gpu_topology_emit_bfs(int start_node_index, int *new_node_count_o
         int curr_size = *sz_curr;
         *sz_next = 0;
 
-        Kokkos::parallel_for("topo_bfs_level", curr_size, KOKKOS_LAMBDA(int i) {
-            BfsItem w = wl_curr(i);
+        {
+            GIZMO_TIMER_SCOPE("topo_bfs_level");
+            Kokkos::parallel_for("topo_bfs_level", curr_size, KOKKOS_LAMBDA(int i) {
+                BfsItem w = wl_curr(i);
 
-            /* Read parent geometry from SoA. */
-            Vec3<MyFloat> pc = soa_center[w.parent_soa];
-            MyFloat       pl = soa_len[w.parent_soa];
-            MyFloat       lh = (MyFloat)(0.25 * (double)pl);  /* offset of child center from parent center */
-            MyFloat       cl = (MyFloat)(0.5  * (double)pl);  /* child len */
+                /* Read parent geometry from SoA. */
+                Vec3<MyFloat> pc = soa_center[w.parent_soa];
+                MyFloat       pl = soa_len[w.parent_soa];
+                MyFloat       lh = (MyFloat)(0.25 * (double)pl);  /* offset of child center from parent center */
+                MyFloat       cl = (MyFloat)(0.5  * (double)pl);  /* child len */
 
-            /* 8-way split.  Default: Morton bits at split level = parent_depth.
-             * Collocation: if the range is fully collocated (LCP >= 126),
-             * Morton-bit split would put everything in one octant -> infinite
-             * recursion.  Reshuffle by random per-particle octant instead,
-             * matching CPU forcetree.cc:267-273 semantics.  Each BFS level
-             * uses parent_depth as the RNG counter, so re-rolls every level. */
-            int child_starts[9];
-            int range_count = w.range_last - w.range_first;
-            int do_random = 0;
-            if(range_count > 1) {
-                int lo_idx = sidx[w.range_first];
-                int hi_idx = sidx[w.range_last - 1];
-                int lcp = gpu_morton_lcp_bits(keys[lo_idx], keys[hi_idx]);
-                if(lcp >= 126) {
-                    /* Collocated range (keys identical). Randomizing octants HERE —
-                     * at the isolation depth, node len ~ the local interparticle
-                     * separation — detaches the descendants' cubes from the true
-                     * particle positions by up to ~len, which silently breaks every
-                     * geometric cube-prune walk (neighbor export, gravity opening).
-                     * The CPU build (forcetree.cc:223) randomizes ONLY once
-                     * len < EPSILON_FOR_TREERND_SUBNODE_SPLITTING * softening, so
-                     * the mislocation is bounded by a scale no physics query can
-                     * resolve. Mirror that floor: ABOVE it, keep the deterministic
-                     * key split (identical keys -> one occupied child; the chain
-                     * descends, len halves, depth advances — no infinite recursion).
-                     * Randomize only below the floor, or when the key bits are
-                     * exhausted (mislocation then <= box/2^42, negligible).
-                     * ForceSoftening not yet cached (first build) reads as 0 ->
-                     * floor 0 -> falls through to the bit-exhaustion arm: safe. */
-                    double split_scale = 0;
-                    for(int j = w.range_first; j < w.range_last; j++) {
-                        int sj = sidx[j];
-                        double fs = (double)P_dev[stp ? stp[sj] : sj].ForceSoftening;
-                        if(j == w.range_first || fs < split_scale) {split_scale = fs;}
+                /* 8-way split.  Default: Morton bits at split level = parent_depth.
+                 * Collocation: if the range is fully collocated (LCP >= 126),
+                 * Morton-bit split would put everything in one octant -> infinite
+                 * recursion.  Reshuffle by random per-particle octant instead,
+                 * matching CPU forcetree.cc:267-273 semantics.  Each BFS level
+                 * uses parent_depth as the RNG counter, so re-rolls every level. */
+                int child_starts[9];
+                int range_count = w.range_last - w.range_first;
+                int do_random = 0;
+                if(range_count > 1) {
+                    int lo_idx = sidx[w.range_first];
+                    int hi_idx = sidx[w.range_last - 1];
+                    int lcp = gpu_morton_lcp_bits(keys[lo_idx], keys[hi_idx]);
+                    if(lcp >= 126) {
+                        /* Collocated range (keys identical). Randomizing octants HERE —
+                         * at the isolation depth, node len ~ the local interparticle
+                         * separation — detaches the descendants' cubes from the true
+                         * particle positions by up to ~len, which silently breaks every
+                         * geometric cube-prune walk (neighbor export, gravity opening).
+                         * The CPU build (forcetree.cc:223) randomizes ONLY once
+                         * len < EPSILON_FOR_TREERND_SUBNODE_SPLITTING * softening, so
+                         * the mislocation is bounded by a scale no physics query can
+                         * resolve. Mirror that floor: ABOVE it, keep the deterministic
+                         * key split (identical keys -> one occupied child; the chain
+                         * descends, len halves, depth advances — no infinite recursion).
+                         * Randomize only below the floor, or when the key bits are
+                         * exhausted (mislocation then <= box/2^42, negligible).
+                         * ForceSoftening not yet cached (first build) reads as 0 ->
+                         * floor 0 -> falls through to the bit-exhaustion arm: safe. */
+                        double split_scale = 0;
+                        for(int j = w.range_first; j < w.range_last; j++) {
+                            int sj = sidx[j];
+                            double fs = (double)P_dev[stp ? stp[sj] : sj].ForceSoftening;
+                            if(j == w.range_first || fs < split_scale) {split_scale = fs;}
+                        }
+                        if((double)cl < EPSILON_FOR_TREERND_SUBNODE_SPLITTING * split_scale
+                           || w.parent_depth >= GIZMO_GPU_MORTON_MAX_DEPTH) {do_random = 1;}
                     }
-                    if((double)cl < EPSILON_FOR_TREERND_SUBNODE_SPLITTING * split_scale
-                       || w.parent_depth >= GIZMO_GPU_MORTON_MAX_DEPTH) {do_random = 1;}
                 }
-            }
-            if(do_random) {
-                /* Inner lambda must NOT use KOKKOS_FUNCTION (extended __host__ __device__
-                 * lambda) -- nvcc forbids nesting extended lambdas inside each other.
-                 * Plain capture is implicitly __device__ inside the outer KOKKOS_LAMBDA. */
-                auto id_of = [P_dev, stp] (int idx) -> uint64_t {
-                    return (uint64_t) P_dev[stp ? stp[idx] : idx].ID;
-                };
-                gpu_morton_split_8way_random_inplace(
-                    sidx + w.range_first, range_count, id_of,
-                    (uint64_t) w.parent_depth, child_starts);
-            } else {
-                gpu_morton_split_8way(sidx, keys, w.range_first, w.range_last,
-                                      w.parent_depth, child_starts);
-            }
+                if(do_random) {
+                    /* Inner lambda must NOT use KOKKOS_FUNCTION (extended __host__ __device__
+                     * lambda) -- nvcc forbids nesting extended lambdas inside each other.
+                     * Plain capture is implicitly __device__ inside the outer KOKKOS_LAMBDA. */
+                    auto id_of = [P_dev, stp] (int idx) -> uint64_t {
+                        return (uint64_t) P_dev[stp ? stp[idx] : idx].ID;
+                    };
+                    gpu_morton_split_8way_random_inplace(
+                        sidx + w.range_first, range_count, id_of,
+                        (uint64_t) w.parent_depth, child_starts);
+                } else {
+                    gpu_morton_split_8way(sidx, keys, w.range_first, w.range_last,
+                                          w.parent_depth, child_starts);
+                }
 
-            for(int k = 0; k < 8; k++) {
-                int rf = w.range_first + child_starts[k];
-                int rl = w.range_first + child_starts[k+1];
-                int cnt = rl - rf;
-                int slot_value = -1;
+                for(int k = 0; k < 8; k++) {
+                    int rf = w.range_first + child_starts[k];
+                    int rl = w.range_first + child_starts[k+1];
+                    int cnt = rl - rf;
+                    int slot_value = -1;
 
 #if TREE_LEAF_BUCKET_SIZE == 1
-                if(cnt == 1) {
+                    if(cnt == 1) {
 #else
-                if(cnt >= 1 && cnt <= TREE_LEAF_BUCKET_SIZE) {
+                    if(cnt >= 1 && cnt <= TREE_LEAF_BUCKET_SIZE) {
 #endif
-                    /* Terminal leaf: this child holds few enough particles that subdividing it
-                     * further costs more tree than it saves work, so it is not split at all.  The
-                     * slot carries the FIRST particle; at a leaf size above one the rest are
-                     * linked behind it once the leaf's successor is known, so a walk reaches them
-                     * exactly as it reaches any run of particles and no walker learns a new node
-                     * kind.  The member count is NOT stored on the tree, because particles are
-                     * inserted into a live tree without a rebuild and any cached count would go
-                     * stale; the record written below describes this build only and is retired
-                     * before anything can insert.
-                     *
-                     * At TREE_LEAF_BUCKET_SIZE == 1 the test above is `cnt == 1` and nothing but
-                     * the slot is written: the historical single-particle leaf, exactly. */
-                    slot_value = stp ? stp[sidx[rf]] : sidx[rf];
+                        /* Terminal leaf: this child holds few enough particles that subdividing it
+                         * further costs more tree than it saves work, so it is not split at all.  The
+                         * slot carries the FIRST particle; at a leaf size above one the rest are
+                         * linked behind it once the leaf's successor is known, so a walk reaches them
+                         * exactly as it reaches any run of particles and no walker learns a new node
+                         * kind.  The member count is NOT stored on the tree, because particles are
+                         * inserted into a live tree without a rebuild and any cached count would go
+                         * stale; the record written below describes this build only and is retired
+                         * before anything can insert.
+                         *
+                         * At TREE_LEAF_BUCKET_SIZE == 1 the test above is `cnt == 1` and nothing but
+                         * the slot is written: the historical single-particle leaf, exactly. */
+                        slot_value = stp ? stp[sidx[rf]] : sidx[rf];
 #if TREE_LEAF_BUCKET_SIZE > 1
-                    if(cnt > 1) {
-                        /* Record the leaf and move on.  Linking the members here would make one
-                         * thread walk the whole leaf while its neighbours handle one particle each,
-                         * which is the imbalance this tree is being changed to avoid; the links are
-                         * written later, one thread per member. */
-                        const int slot = Kokkos::atomic_fetch_add(chain_n, 1);
-                        if(slot < chain_cap) {
-                            chain_out[slot].range_first = rf;
-                            chain_out[slot].count       = cnt;
-                            chain_out[slot].parent_abs  = tree_base + w.parent_soa;
-                            chain_out[slot].successor   = -1;
+                        if(cnt > 1) {
+                            /* Record the leaf and move on.  Linking the members here would make one
+                             * thread walk the whole leaf while its neighbours handle one particle each,
+                             * which is the imbalance this tree is being changed to avoid; the links are
+                             * written later, one thread per member. */
+                            const int slot = Kokkos::atomic_fetch_add(chain_n, 1);
+                            if(slot < chain_cap) {
+                                chain_out[slot].range_first = rf;
+                                chain_out[slot].count       = cnt;
+                                chain_out[slot].parent_abs  = tree_base + w.parent_soa;
+                                chain_out[slot].successor   = -1;
+                            }
                         }
-                    }
 #endif
-                } else if(cnt > 1) {
-                    /* Allocate a new internal node from the device counter.
-                     * Collocation in the sub-range is OK -- the next BFS
-                     * level on this child will trigger the random reshuffle
-                     * at its parent boundary check. */
-                    int new_soa = Kokkos::atomic_fetch_add(ncount, 1);
-                    if(new_soa >= max_nodes) {
-                        Kokkos::atomic_fetch_max(fail, 1);
-                        continue;
+                    } else if(cnt > 1) {
+                        /* Allocate a new internal node from the device counter.
+                         * Collocation in the sub-range is OK -- the next BFS
+                         * level on this child will trigger the random reshuffle
+                         * at its parent boundary check. */
+                        int new_soa = Kokkos::atomic_fetch_add(ncount, 1);
+                        if(new_soa >= max_nodes) {
+                            Kokkos::atomic_fetch_max(fail, 1);
+                            continue;
+                        }
+                        /* Initialize child node geometry + suns + father. */
+                        Vec3<MyFloat> cc;
+                        cc[0] = pc[0] + ((k & 1) ? lh : -lh);
+                        cc[1] = pc[1] + ((k & 2) ? lh : -lh);
+                        cc[2] = pc[2] + ((k & 4) ? lh : -lh);
+                        soa_center[new_soa] = cc;
+                        soa_len[new_soa]    = cl;
+                        if(soa_ti) {soa_ti[new_soa] = ti_build;}   /* pairs with the length */
+                        soa_father[new_soa] = w.parent_soa + tree_base;
+                        long sb = (long)new_soa * 8;
+                        for(int s = 0; s < 8; s++) {soa_suns[sb + s] = -1;}
+
+                        slot_value = tree_base + new_soa;
+
+                        /* Push child BFS entry. */
+                        BfsItem nw;
+                        nw.parent_soa   = new_soa;
+                        nw.range_first  = rf;
+                        nw.range_last   = rl;
+                        nw.parent_depth = w.parent_depth + 1;
+                        int slot = Kokkos::atomic_fetch_add(sz_next, 1);
+                        if(slot < max_nodes) {wl_next(slot) = nw;}
+                        else {Kokkos::atomic_fetch_max(fail, 1);}
                     }
-                    /* Initialize child node geometry + suns + father. */
-                    Vec3<MyFloat> cc;
-                    cc[0] = pc[0] + ((k & 1) ? lh : -lh);
-                    cc[1] = pc[1] + ((k & 2) ? lh : -lh);
-                    cc[2] = pc[2] + ((k & 4) ? lh : -lh);
-                    soa_center[new_soa] = cc;
-                    soa_len[new_soa]    = cl;
-                    if(soa_ti) {soa_ti[new_soa] = ti_build;}   /* pairs with the length */
-                    soa_father[new_soa] = w.parent_soa + tree_base;
-                    long sb = (long)new_soa * 8;
-                    for(int s = 0; s < 8; s++) {soa_suns[sb + s] = -1;}
-
-                    slot_value = tree_base + new_soa;
-
-                    /* Push child BFS entry. */
-                    BfsItem nw;
-                    nw.parent_soa   = new_soa;
-                    nw.range_first  = rf;
-                    nw.range_last   = rl;
-                    nw.parent_depth = w.parent_depth + 1;
-                    int slot = Kokkos::atomic_fetch_add(sz_next, 1);
-                    if(slot < max_nodes) {wl_next(slot) = nw;}
-                    else {Kokkos::atomic_fetch_max(fail, 1);}
+                    /* Write parent.suns[k]. */
+                    long pb = (long)w.parent_soa * 8;
+                    soa_suns[pb + k] = slot_value;
                 }
-                /* Write parent.suns[k]. */
-                long pb = (long)w.parent_soa * 8;
-                soa_suns[pb + k] = slot_value;
-            }
-        });
-        Kokkos::fence();
-        gizmo_gpu_check_last_error("topo_bfs_level", curr_size);
+            });
+            Kokkos::fence();
+            gizmo_gpu_check_last_error("topo_bfs_level", curr_size);
+        }
 
         /* Swap worklists. */
         Kokkos::View<BfsItem*, MemSpace> tmp = wl_curr; wl_curr = wl_next; wl_next = tmp;
@@ -981,24 +1022,27 @@ extern "C" int gpu_topology_emit_bfs(int start_node_index, int *new_node_count_o
             return 3;
         }
         badrec[0] = -1; badrec[1] = 0;
-        Kokkos::parallel_for("leaf_chain_check", nrec_chk, KOKKOS_LAMBDA(int r) {
-            const struct LeafChainRecord d = chk[r];
-            int why = 0;
-            if(d.count < 2)                                   {why = 1;}
-            else if(d.range_first < 0 || d.range_first + d.count > np_chk) {why = 2;}
-            else if(d.parent_abs < node_lo || d.parent_abs >= node_hi)     {why = 3;}
-            else {
-                for(int m = 0; m < d.count && !why; m++) {
-                    const int s = sidx_chk[d.range_first + m];
-                    if(s < 0 || s >= np_chk) {why = 4; break;}
-                    const int pp = stp_chk ? stp_chk[s] : s;
-                    if(pp < 0 || pp >= slots_chk) {why = 5; break;}
+        {
+            GIZMO_TIMER_SCOPE("leaf_chain_check");
+            Kokkos::parallel_for("leaf_chain_check", nrec_chk, KOKKOS_LAMBDA(int r) {
+                const struct LeafChainRecord d = chk[r];
+                int why = 0;
+                if(d.count < 2)                                   {why = 1;}
+                else if(d.range_first < 0 || d.range_first + d.count > np_chk) {why = 2;}
+                else if(d.parent_abs < node_lo || d.parent_abs >= node_hi)     {why = 3;}
+                else {
+                    for(int m = 0; m < d.count && !why; m++) {
+                        const int s = sidx_chk[d.range_first + m];
+                        if(s < 0 || s >= np_chk) {why = 4; break;}
+                        const int pp = stp_chk ? stp_chk[s] : s;
+                        if(pp < 0 || pp >= slots_chk) {why = 5; break;}
+                    }
                 }
-            }
-            if(why) {if(Kokkos::atomic_fetch_add(&badrec[1], 1) == 0) {badrec[0] = r * 8 + why;}}
-        });
-        Kokkos::fence();
-        gizmo_gpu_check_last_error("leaf_chain_check", nrec_chk);
+                if(why) {if(Kokkos::atomic_fetch_add(&badrec[1], 1) == 0) {badrec[0] = r * 8 + why;}}
+            });
+            Kokkos::fence();
+            gizmo_gpu_check_last_error("leaf_chain_check", nrec_chk);
+        }
         const int nbad = badrec[1];
         /* Whichever thread won the counter writes this, so a nonzero count should always carry a
          * record; clamp anyway, because the alternative is indexing the reason table at -1. */
@@ -1056,6 +1100,7 @@ extern "C" int gpu_topology_emit_bfs(int start_node_index, int *new_node_count_o
 }
 extern "C" int gpu_topology_writeback_to_aos(int first_soa_idx, int last_soa_idx)
 {
+    GIZMO_TIMER_FUNCTION();
     if(last_soa_idx <= first_soa_idx) {return 0;}
 
     struct gpu_gravity_tree_soa_t *soa = gpu_gravity_tree_soa();
@@ -1071,22 +1116,25 @@ extern "C" int gpu_topology_writeback_to_aos(int first_soa_idx, int last_soa_idx
     struct NODE *Nodes_uvm = Nodes_base;
     int range = last_soa_idx - first_soa_idx;
     int base_k = first_soa_idx;
-    Kokkos::parallel_for("topo_writeback_to_aos", range, KOKKOS_LAMBDA(int j) {
-        int k = base_k + j;
-        long sb = (long)k * 8;
-        Nodes_uvm[k].u.suns[0] = soa_suns[sb + 0];
-        Nodes_uvm[k].u.suns[1] = soa_suns[sb + 1];
-        Nodes_uvm[k].u.suns[2] = soa_suns[sb + 2];
-        Nodes_uvm[k].u.suns[3] = soa_suns[sb + 3];
-        Nodes_uvm[k].u.suns[4] = soa_suns[sb + 4];
-        Nodes_uvm[k].u.suns[5] = soa_suns[sb + 5];
-        Nodes_uvm[k].u.suns[6] = soa_suns[sb + 6];
-        Nodes_uvm[k].u.suns[7] = soa_suns[sb + 7];
-        Nodes_uvm[k].len       = soa_len[k];
-        Nodes_uvm[k].center    = soa_center[k];
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("topo_writeback_to_aos", range);
+    {
+        GIZMO_TIMER_SCOPE("topo_writeback_to_aos");
+        Kokkos::parallel_for("topo_writeback_to_aos", range, KOKKOS_LAMBDA(int j) {
+            int k = base_k + j;
+            long sb = (long)k * 8;
+            Nodes_uvm[k].u.suns[0] = soa_suns[sb + 0];
+            Nodes_uvm[k].u.suns[1] = soa_suns[sb + 1];
+            Nodes_uvm[k].u.suns[2] = soa_suns[sb + 2];
+            Nodes_uvm[k].u.suns[3] = soa_suns[sb + 3];
+            Nodes_uvm[k].u.suns[4] = soa_suns[sb + 4];
+            Nodes_uvm[k].u.suns[5] = soa_suns[sb + 5];
+            Nodes_uvm[k].u.suns[6] = soa_suns[sb + 6];
+            Nodes_uvm[k].u.suns[7] = soa_suns[sb + 7];
+            Nodes_uvm[k].len       = soa_len[k];
+            Nodes_uvm[k].center    = soa_center[k];
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("topo_writeback_to_aos", range);
+    }
     return 0;
 }
 
@@ -1116,6 +1164,7 @@ extern "C" const int *gpu_topology_build_particle_topleaf(void)  { return g_part
  * moments are accumulated. */
 extern "C" int gpu_leaf_chain_assign_fathers(void)
 {
+    GIZMO_TIMER_FUNCTION();
 #if TREE_LEAF_BUCKET_SIZE == 1
     return 0;
 #else
@@ -1187,6 +1236,7 @@ extern "C" int gpu_leaf_chain_assign_fathers(void)
  * out the rest. */
 extern "C" int gpu_leaf_chain_materialize(void)
 {
+    GIZMO_TIMER_FUNCTION();
 #if TREE_LEAF_BUCKET_SIZE == 1
     return 0;
 #else
@@ -1208,12 +1258,15 @@ extern "C" int gpu_leaf_chain_materialize(void)
     const int *stp  = g_slot_map_active ? g_slot_to_particle : NULL;
 
     /* 1. take each leaf's successor off its head, before anything overwrites it */
-    Kokkos::parallel_for("leaf_chain_capture", nrec, KOKKOS_LAMBDA(int r) {
-        const int s = sidx[rec[r].range_first];
-        rec[r].successor = aux[stp ? stp[s] : s];
-    });
-    Kokkos::fence();
-    gizmo_gpu_check_last_error("leaf_chain_capture", nrec);
+    {
+        GIZMO_TIMER_SCOPE("leaf_chain_capture");
+        Kokkos::parallel_for("leaf_chain_capture", nrec, KOKKOS_LAMBDA(int r) {
+            const int s = sidx[rec[r].range_first];
+            rec[r].successor = aux[stp ? stp[s] : s];
+        });
+        Kokkos::fence();
+        gizmo_gpu_check_last_error("leaf_chain_capture", nrec);
+    }
 
     /* 2. join the members, successor onto the last */
     int *bad = (int *) gizmo_gpu_alloc_shared(sizeof(int), "treescratch_build_ctr");

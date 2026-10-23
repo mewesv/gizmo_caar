@@ -4,6 +4,7 @@
  * sequencing rationale.
  *
  * Written by Philip F. Hopkins (phopkins@caltech.edu) for GIZMO. */
+#include "../system/timer.h"
 
 #include <mpi.h>
 #include <stdio.h>
@@ -58,8 +59,14 @@ global_active_gas_counts(long long *out_sum, int *out_max, long long *out_sum_al
     int local_max = (int) local_sums[0];
     long long sums[2] = {local_sums[0], local_sums[1]};
     if(NTask > 1) {
-        MPI_Allreduce(local_sums, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&local_max, out_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(local_sums, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        }
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_max, out_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        }
     } else {
         *out_max = local_max;
     }
@@ -95,6 +102,7 @@ bool gizmo_hydro_corridor_mg_needs_all_gas(void) {return g_mg_needs_all_gas;}
  * materialized, so that [0, N_gas) is exactly the owned gas block. */
 static void drift_local_gas_to_current_time(void)
 {
+    GIZMO_TIMER_FUNCTION();
     std::vector<int> drifted((size_t) N_gas); int n_drifted = 0;
     drift_particles_batch(NULL, N_gas, All.Ti_Current, drifted.data(), &n_drifted);
     if(n_drifted > 0) {   /* a repeat import in the same step finds nothing behind */
@@ -105,6 +113,7 @@ static void drift_local_gas_to_current_time(void)
 
 void gizmo_hydro_corridor_import_gas_ghosts(double safety)
 {
+    GIZMO_TIMER_FUNCTION();
     if(!g_mg_needs_all_gas) {ghost_exchange_hydro(safety); return;}
     drift_local_gas_to_current_time();
     std::vector<double> query_pos, query_h;
@@ -123,6 +132,7 @@ void gizmo_hydro_corridor_import_gas_ghosts(double safety)
 
 void gizmo_hydro_corridor_decide_mode(void)
 {
+    GIZMO_TIMER_FUNCTION();
 #ifdef TRANSPORT_SUBCYCLE
 #ifdef MHD_MODIFIED_GRADIENT
     {long long sum_active_gas = 0, sum_active_all_gas = 0; int max_active_gas = 0;
@@ -189,6 +199,7 @@ static unsigned long long g_corridor_pool_epoch = 0;
 
 void gizmo_hydro_corridor_begin(void)
 {
+    GIZMO_TIMER_FUNCTION();
     if(g_corridor_mode == GizmoHydroCorridorMode::UNSET) return; /* defensive: decide_mode not run */
 
     /* Mode B: build ONLY the shared active-index list (the request-driven
@@ -261,6 +272,7 @@ bool gizmo_hydro_corridor_csr_arrays(const int **rows, int *n_rows, const int64_
 
 void gizmo_hydro_corridor_refresh_ghost_values(const char *stage)
 {
+    GIZMO_TIMER_FUNCTION();
     /* No-op unless the corridor owns a published Mode-A view this step —
      * Mode B / fallback paths keep their own refresh semantics. At NTask==1
      * there are no ghosts and owner values are read directly: nothing to
@@ -278,7 +290,10 @@ void gizmo_hydro_corridor_refresh_ghost_values(const char *stage)
      * down by an intervening loop's own ghost lifecycle, epoch mismatch, or
      * a refresh-guard failure — falls CLOSED to the full path below. */
     int same_pool = (ghost_pool_is_live() && ghost_provenance_epoch() == g_corridor_pool_epoch) ? 1 : 0;
-    MPI_Allreduce(MPI_IN_PLACE, &same_pool, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);   /* both paths are collective */
+    {
+        GIZMO_TIMER_SCOPE("MPI_Allreduce");
+        MPI_Allreduce(MPI_IN_PLACE, &same_pool, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    }   /* both paths are collective */
     if(same_pool) {
         int refresh_rc = ghost_refresh_values();
         if(refresh_rc == GHOST_REFRESH_OK) {
@@ -313,6 +328,7 @@ void gizmo_hydro_corridor_refresh_ghost_values(const char *stage)
 
 void gizmo_hydro_corridor_end(void)
 {
+    GIZMO_TIMER_FUNCTION();
     g_corridor_mode      = GizmoHydroCorridorMode::UNSET;
     g_corridor_csr_valid = false;
     g_mg_step            = false;

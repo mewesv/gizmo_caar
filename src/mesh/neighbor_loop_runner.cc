@@ -20,6 +20,7 @@
  *
  * Written by Phil Hopkins (phopkins@caltech.edu) for GIZMO.
  */
+#include "../system/timer.h"
 
 #include <mpi.h>
 #include <cstdarg>                                   /* va_list, vfprintf for nlr_warn_once_rank0 */
@@ -565,6 +566,7 @@ static void collect_candidates_pre_drift(const neighbor_loop_args& args,
                                           DispatchPath backend,
                                           std::vector<std::vector<int>>& per_active_cands)
 {
+    GIZMO_TIMER_FUNCTION();
     /* neighbor_type_mask is an explicit caller parameter (mask-threading
      * refactor). Non-iter callers pass Spec::neighbor_type_mask (unchanged
      * behavior); iter dispatch passes sg.j_type_bitmask for per-subgroup walks. */
@@ -736,6 +738,7 @@ static void drift_and_filter_candidates(std::vector<std::vector<int>>& per_activ
                                         unsigned int neighbor_type_mask,
                                         QueryAt query_at)
 {
+    GIZMO_TIMER_FUNCTION();
     const double jscale = nlr_spec_symmetric_j_radius_scale<Spec>();
     const size_t n_queries = per_active_cands.size();
     std::vector<double> queries(4 * n_queries);   /* pos[3], h_q per query */
@@ -769,6 +772,7 @@ static void evaluate_pairs_post_drift(const DeviceCtx& ctx,
                                        const typename Spec::CallScalars& cs,
                                        EvalOMPPolicy eval_policy)
 {
+    GIZMO_TIMER_FUNCTION();
     using NeighborData = typename Spec::NeighborData;
     using ScatterData  = typename Spec::ScatterData;
     const struct GxMotionTargetSet motion_targets = gx_motion_target_view();
@@ -883,6 +887,7 @@ static void build_self_actives_host_pre_drift(
 template <typename Spec>
 static void run_mode_b_local(const neighbor_loop_args& args, const double *radii)
 {
+    GIZMO_TIMER_FUNCTION();
     using ActiveData = typename Spec::ActiveData;
     using AccumData  = typename Spec::AccumData;
     using DeviceCtx  = typename Spec::DeviceContext;
@@ -1864,7 +1869,10 @@ static void mode_b_remote_evaluate_into_buffer(
          * draining. */
         int ndone_flag = (cursor >= N) ? 1 : 0;
         {
-            MPI_Allreduce(&ndone_flag, &ndone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                MPI_Allreduce(&ndone_flag, &ndone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            }
         }
     } while(ndone < NTask);
 
@@ -1886,6 +1894,7 @@ static void mode_b_remote_evaluate_into_buffer(
 template <typename Spec>
 static void run_mode_b_remote_impl(const neighbor_loop_args& args, const double *radii)
 {
+    GIZMO_TIMER_FUNCTION();
     using AccumData    = typename Spec::AccumData;
     using DeviceCtx    = typename Spec::DeviceContext;
 
@@ -1951,6 +1960,7 @@ static void run_mode_b_remote_impl(const neighbor_loop_args& args, const double 
 
 template <typename Spec>
 static void run_mode_b_remote(const neighbor_loop_args& args, const double *radii) {
+    GIZMO_TIMER_FUNCTION();
     run_mode_b_remote_impl<Spec>(args, radii);
 }
 
@@ -1973,6 +1983,7 @@ template <typename Spec>
 static void run_mode_d(const neighbor_loop_args& args, const double *radii,
                        const GxDeviceTreeView& tree)
 {
+    GIZMO_TIMER_FUNCTION();
     using AccumData = typename Spec::AccumData;
     using DeviceCtx = typename Spec::DeviceContext;
 
@@ -2428,6 +2439,7 @@ static int nlr_mode_a_team_width(const Functor& f)
 template <typename Spec>
 static void run_mode_a(const neighbor_loop_args& args, const double *radii)
 {
+    GIZMO_TIMER_FUNCTION();
     using ActiveData   = typename Spec::ActiveData;
     using AccumData    = typename Spec::AccumData;
     using ScatterData  = typename Spec::ScatterData;
@@ -2953,6 +2965,7 @@ struct GxTouchedEpochGuard {
 template <typename Spec>
 void run_neighbor_loop(const neighbor_loop_args& args_in)
 {
+    GIZMO_TIMER_FUNCTION();
     /* The one live argument view for this call.  A ghost import can raise the particle
      * capacity and move P[]/CellP[], so the cached base pointers are refreshed in this
      * object below; every later reader sees the current values.  There is deliberately no
@@ -3021,8 +3034,14 @@ void run_neighbor_loop(const neighbor_loop_args& args_in)
     if(!force_a && !force_b) {
         int local_act = args.num_active;
         int sum_act = 0, max_act = 0;
-        MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&local_act, &max_act, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        }
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &max_act, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        }
         global_num_active = sum_act;
         selected_mode = nlr_select_mode<Spec>(sum_act, max_act);
         select_mode_b = (selected_mode == NlrMode::B);
@@ -3031,7 +3050,10 @@ void run_neighbor_loop(const neighbor_loop_args& args_in)
          * needs the global count, so it is done here. */
         int local_act = args.num_active;
         int sum_act = 0;
-        MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        }
         global_num_active = sum_act;
     }
     /* Globally-zero-active call: do NO neighbor work. global_num_active is the
@@ -3088,7 +3110,10 @@ void run_neighbor_loop(const neighbor_loop_args& args_in)
              * the vote below decides for the call. */
             touched_epoch.held = ready_local;
             int ready = 0;
-            MPI_Allreduce(&ready_local, &ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                MPI_Allreduce(&ready_local, &ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            }
             if(ready) {plan.path = NeighborLoopPlan::Path::ModeD_DeviceFused;}
         }
     }
@@ -3451,6 +3476,7 @@ NlrIterDriver<Spec>::~NlrIterDriver()
 template <typename Spec>
 void NlrIterDriver<Spec>::initialize_device_context_mode_b()
 {
+    GIZMO_TIMER_FUNCTION();
     using DeviceCtx = typename Spec::DeviceContext;
     static_assert(std::is_base_of<NeighborLoopDeviceContextBase, DeviceCtx>::value,
                   "Spec::DeviceContext must publicly derive from NeighborLoopDeviceContextBase");
@@ -3562,6 +3588,7 @@ template <typename Spec>
 void nlr_import_union_ghosts(unsigned int mask_union, const std::vector<int> &actives,
                              const std::vector<double> &radii, double ghost_safety_factor)
 {
+    GIZMO_TIMER_FUNCTION();
     std::vector<double> padded(radii.size());
     for (size_t k = 0; k < radii.size(); k++) {padded[k] = radii[k] * Spec::mode_a_csr_buffer_factor;}
     const int n = (int)actives.size();
@@ -3574,6 +3601,7 @@ void nlr_import_union_ghosts(unsigned int mask_union, const std::vector<int> &ac
 template <typename Spec>
 void NlrIterDriver<Spec>::acquire_arena_and_init_ctx_mode_a()
 {
+    GIZMO_TIMER_FUNCTION();
     if (arena_acquired) {
         if (ThisTask == 0) {
             fprintf(stderr,
@@ -3662,6 +3690,7 @@ void NlrIterDriver<Spec>::acquire_arena_and_init_ctx_mode_a()
 template <typename Spec>
 void NlrIterDriver<Spec>::acquire_arena_and_init_ctx_mode_d()
 {
+    GIZMO_TIMER_FUNCTION();
     if (arena_acquired) {return;}
 
     GIZMO_GPU_ENSURE_ALL_FRESH();
@@ -3698,6 +3727,7 @@ void NlrIterDriver<Spec>::acquire_arena_and_init_ctx_mode_d()
 template <typename Spec>
 void NlrIterDriver<Spec>::rebuild_mode_a_arena_and_ctx_for_current_active_union()
 {
+    GIZMO_TIMER_FUNCTION();
     if (NTask <= 1) {
         /* Single rank: no ghost pool to manage. Just invalidate all CSR
          * caches; per-subgroup dispatch will rebuild local CSRs on first
@@ -3841,6 +3871,7 @@ void NlrIterDriver<Spec>::rebuild_mode_a_arena_and_ctx_for_current_active_union(
 template <typename Spec>
 static void nlr_iter_dispatch_subgroup_mode_b_remote(NlrIterDriver<Spec>& drv, int sg)
 {
+    GIZMO_TIMER_FUNCTION();
     using AccumData = typename Spec::AccumData;
 
     const NlrSubgroup& sgr = drv.args.subgroups[sg];
@@ -5300,6 +5331,7 @@ struct NlrPeerAnswerDeviceFused {
 template <typename Spec>
 static void nlr_iter_dispatch_subgroup_mode_a(NlrIterDriver<Spec>& drv, int sg)
 {
+    GIZMO_TIMER_FUNCTION();
     using ActiveData   = typename Spec::ActiveData;
     using AccumData    = typename Spec::AccumData;
     using ScatterData  = typename Spec::ScatterData;
@@ -5575,6 +5607,7 @@ static void nlr_iter_dispatch_subgroup_mode_a(NlrIterDriver<Spec>& drv, int sg)
 template <typename Spec>
 static void nlr_iter_dispatch_subgroup_mode_b_local(NlrIterDriver<Spec>& drv, int sg)
 {
+    GIZMO_TIMER_FUNCTION();
     using ActiveData  = typename Spec::ActiveData;
     using AccumData   = typename Spec::AccumData;
 
@@ -5697,6 +5730,7 @@ static void nlr_default_on_max_iter_exceeded(const NlrIterDriver<Spec>& drv)
 template <typename Spec>
 static void nlr_iter_dispatch_subgroup_mode_d(NlrIterDriver<Spec>& drv, int sg)
 {
+    GIZMO_TIMER_FUNCTION();
     using AccumData = typename Spec::AccumData;
 
     const NlrSubgroup& sgr = drv.args.subgroups[sg];
@@ -5850,6 +5884,7 @@ static bool nlr_mode_d_evaluate_single_rank(const typename Spec::DeviceContext& 
 template <typename Spec>
 void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
 {
+    GIZMO_TIMER_FUNCTION();
     /* Retires this call's touched-set epoch on every way out, exactly as the non-iterative
      * runner does.  The iterative driver opens its own epoch at its own dispatch decision, so
      * it owns its own retirement: without this the recorder stays held after the first
@@ -5979,8 +6014,11 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
         path = DispatchPath::ModeA_GPU_NGL;
     } else if (force_mode == NlrForceMode::B) {
         int local_act = args.num_active;
-        MPI_Allreduce(&local_act, &forced_modeb_global_active, 1,
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &forced_modeb_global_active, 1,
                       MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        }
         global_active_sum = forced_modeb_global_active;
         path = DispatchPath::ModeB_HostWalker;
     } else {
@@ -5988,8 +6026,14 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
          * (= union across subgroups). */
         int local_act = args.num_active;
         int sum_act = 0, max_act = 0;
-        MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&local_act, &max_act, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &sum_act, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        }
+        {
+            GIZMO_TIMER_SCOPE("MPI_Allreduce");
+            MPI_Allreduce(&local_act, &max_act, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        }
         global_active_sum = sum_act;
         const NlrMode mode = nlr_select_mode<Spec>(sum_act, max_act);
         path = (mode == NlrMode::B) ? DispatchPath::ModeB_HostWalker : DispatchPath::ModeA_GPU_NGL;
@@ -6031,7 +6075,10 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
             /* Open exactly when this rank's own preparation succeeded, whatever the vote decides. */
             touched_epoch.held = ready_local;
             int ready = 0;
-            MPI_Allreduce(&ready_local, &ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                MPI_Allreduce(&ready_local, &ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            }
             if(ready) {path = DispatchPath::ModeD_DeviceFused;}
         }
     }
@@ -6208,7 +6255,10 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
              * collectives below (a lone asserting rank would otherwise desync). */
             int global_partition_bad = local_partition_bad;
             if (NTask > 1) {
-                MPI_Allreduce(&local_partition_bad, &global_partition_bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+                {
+                    GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                    MPI_Allreduce(&local_partition_bad, &global_partition_bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+                }
             }
             if (global_partition_bad) {
                 endrun(90001020);
@@ -6255,8 +6305,11 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
             }
             int global_needs_rebuild = local_needs_rebuild;
             if (NTask > 1) {
-                MPI_Allreduce(&local_needs_rebuild, &global_needs_rebuild, 1,
+                {
+                    GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                    MPI_Allreduce(&local_needs_rebuild, &global_needs_rebuild, 1,
                               MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+                }
             }
             if (global_needs_rebuild) {
                 drv.rebuild_mode_a_arena_and_ctx_for_current_active_union();
@@ -6313,73 +6366,76 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
 
         /* (b) Per-active Spec::after_iter — collect IterStatus, compact
          * active_set per subgroup, mutate radii on AdjustRadius. */
-        drv.local_active_total = 0;
-        for (int sg = 0; sg < args.num_subgroups; sg++) {
-            int n_compacted   = drv.active_set_size[sg];
-            int write_idx     = 0;
-            for (int k = 0; k < n_compacted; k++) {
-                int  slot = drv.active_set_uvm[sg][k];
-                int  i    = args.subgroups[sg].active_indices[slot];
-                AfterIterContext<Spec> ctx{
-                    args, sg, slot, i, drv.iter_index,
-                    /* h_search_current */ drv.radii_uvm[sg][slot],
-                    /* scalars (ref to driver-owned) */ drv.cs,
-                    /* scratch (mutable ref) */          drv.scratch_uvm[sg][slot]
-                };
-                IterResult r = Spec::after_iter(ctx, drv.accum_uvm[sg][slot]);
-                switch (r.status) {
-                    case IterStatus::Converged:
-                        /* Drop slot from compacted active_set; its accum_uvm
-                         * stays so apply_active_writeback can read it post-loop. */
-                        break;
-                    case IterStatus::NeedsMore:
-                        drv.active_set_uvm[sg][write_idx++] = slot;
-                        break;
-                    case IterStatus::AdjustRadius:
-                        drv.radii_uvm[sg][slot] = r.new_h_search;
-                        drv.active_set_uvm[sg][write_idx++] = slot;
-                        break;
-                    default:
-                        /* Unknown enum = Spec bug. Soft bad-stop + drop the
-                         * slot as converged (do not re-queue): the run still
-                         * stops at the next poll, but stays lockstep with
-                         * peers through this iteration's collectives. The
-                         * stderr above surfaces the bug — not masked. */
-                        if (ThisTask == 0) {
-                            fprintf(stderr,
-                                "[run_neighbor_loop_iterative<%s>] FATAL: Spec::after_iter "
-                                "returned unknown IterStatus=%d at iter=%d sg=%d slot=%d "
-                                "(particle index i=%d). Valid values: 0=Converged, "
-                                "1=NeedsMore, 2=AdjustRadius.\n",
-                                Spec::loop_name, (int)r.status,
-                                drv.iter_index, sg, slot, i);
-                            fflush(stderr);
-                        }
-                        endrun(81206);
-                        break;
-                }
-            }
-            drv.active_set_size[sg]     = write_idx;
-            drv.local_active_per_sg[sg] = write_idx;
-            drv.local_active_total     += write_idx;
-        }
-
-
-        /* (b.5) Mode A buffer-exceedance rebuild trigger.
-         * After radii mutation on AdjustRadius, check if any still-active
-         * slot's radius now exceeds its buffered radius (built oversized
-         * at last build). If so, invalidate that subgroup's cached CSR;
-         * next iter's dispatch will rebuild. Mirrors legacy density_gpu.cc:
-         * 152-188 rebuild trigger. */
-        if (path == DispatchPath::ModeA_GPU_NGL) {
+        {
+            GIZMO_TIMER_SCOPE("after_iter_and_compact");
+            drv.local_active_total = 0;
             for (int sg = 0; sg < args.num_subgroups; sg++) {
-                if (!drv.mode_a_csr_valid[sg]) continue;
-                int n_compacted = drv.active_set_size[sg];
+                int n_compacted   = drv.active_set_size[sg];
+                int write_idx     = 0;
                 for (int k = 0; k < n_compacted; k++) {
-                    int slot = drv.active_set_uvm[sg][k];
-                    if (drv.radii_uvm[sg][slot] > drv.mode_a_csr_buffered_h[sg][slot]) {
-                        drv.mode_a_csr_valid[sg] = false;
-                        break;
+                    int  slot = drv.active_set_uvm[sg][k];
+                    int  i    = args.subgroups[sg].active_indices[slot];
+                    AfterIterContext<Spec> ctx{
+                        args, sg, slot, i, drv.iter_index,
+                        /* h_search_current */ drv.radii_uvm[sg][slot],
+                        /* scalars (ref to driver-owned) */ drv.cs,
+                        /* scratch (mutable ref) */          drv.scratch_uvm[sg][slot]
+                    };
+                    IterResult r = Spec::after_iter(ctx, drv.accum_uvm[sg][slot]);
+                    switch (r.status) {
+                        case IterStatus::Converged:
+                            /* Drop slot from compacted active_set; its accum_uvm
+                             * stays so apply_active_writeback can read it post-loop. */
+                            break;
+                        case IterStatus::NeedsMore:
+                            drv.active_set_uvm[sg][write_idx++] = slot;
+                            break;
+                        case IterStatus::AdjustRadius:
+                            drv.radii_uvm[sg][slot] = r.new_h_search;
+                            drv.active_set_uvm[sg][write_idx++] = slot;
+                            break;
+                        default:
+                            /* Unknown enum = Spec bug. Soft bad-stop + drop the
+                             * slot as converged (do not re-queue): the run still
+                             * stops at the next poll, but stays lockstep with
+                             * peers through this iteration's collectives. The
+                             * stderr above surfaces the bug — not masked. */
+                            if (ThisTask == 0) {
+                                fprintf(stderr,
+                                    "[run_neighbor_loop_iterative<%s>] FATAL: Spec::after_iter "
+                                    "returned unknown IterStatus=%d at iter=%d sg=%d slot=%d "
+                                    "(particle index i=%d). Valid values: 0=Converged, "
+                                    "1=NeedsMore, 2=AdjustRadius.\n",
+                                    Spec::loop_name, (int)r.status,
+                                    drv.iter_index, sg, slot, i);
+                                fflush(stderr);
+                            }
+                            endrun(81206);
+                            break;
+                    }
+                }
+                drv.active_set_size[sg]     = write_idx;
+                drv.local_active_per_sg[sg] = write_idx;
+                drv.local_active_total     += write_idx;
+            }
+
+
+            /* (b.5) Mode A buffer-exceedance rebuild trigger.
+             * After radii mutation on AdjustRadius, check if any still-active
+             * slot's radius now exceeds its buffered radius (built oversized
+             * at last build). If so, invalidate that subgroup's cached CSR;
+             * next iter's dispatch will rebuild. Mirrors legacy density_gpu.cc:
+             * 152-188 rebuild trigger. */
+            if (path == DispatchPath::ModeA_GPU_NGL) {
+                for (int sg = 0; sg < args.num_subgroups; sg++) {
+                    if (!drv.mode_a_csr_valid[sg]) continue;
+                    int n_compacted = drv.active_set_size[sg];
+                    for (int k = 0; k < n_compacted; k++) {
+                        int slot = drv.active_set_uvm[sg][k];
+                        if (drv.radii_uvm[sg][slot] > drv.mode_a_csr_buffered_h[sg][slot]) {
+                            drv.mode_a_csr_valid[sg] = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -6387,6 +6443,7 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
 
         /* (c) Spec::after_iter_global — host-only, no-MPI (TRAP 7). */
         if constexpr (nlr_spec_has_after_iter_global_v<Spec>) {
+            GIZMO_TIMER_SCOPE("after_iter_global");
             Spec::after_iter_global(args, drv);
         }
 
@@ -6396,9 +6453,12 @@ void run_neighbor_loop_iterative(const neighbor_loop_args_iterative& args_in)
          * Globally-converged subgroups (global_active_per_sg[sg]==0) skip
          * the per-iter dispatch + collective on the next iteration. */
         if (NTask > 1) {
-            MPI_Allreduce(drv.local_active_per_sg.data(),
+            {
+                GIZMO_TIMER_SCOPE("MPI_Allreduce");
+                MPI_Allreduce(drv.local_active_per_sg.data(),
                           drv.global_active_per_sg.data(),
                           args.num_subgroups, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            }
         } else {
             drv.global_active_per_sg = drv.local_active_per_sg;
         }
