@@ -412,7 +412,7 @@ void GradientsIterSpec::apply_active_writeback(const neighbor_loop_args& args,
  * ========================================================================== */
 void hydro_gradient_calc(void)
 {
-    GIZMO_TIMER_SCOPE("Gradients");
+    GIZMO_TIMER_FUNCTION();
     CPU_Step[CPU_DENSMISC] += measure_time();
     double t0 = my_second();
 
