@@ -6,6 +6,7 @@
 #include "../declarations/allvars.h"
 #include "../declarations/multifluid_helpers.h"
 #include "../core/proto.h"
+#include "../declarations/gpu_rng.h"
 #include "../mesh/kernel.h"
 #include "../eos/composition_registry.h"
 
@@ -115,6 +116,9 @@ void init(void)
     set_softenings();
 
     All.NumCurrentTiStep = 0;	/* setup some counters */
+#ifdef RANDOMIZE_GRAVTREE
+    All.RandomTreeDraws = 0;
+#endif
     All.SnapshotFileCount = 0;
     if(RestartFlag == 2)
     {
@@ -206,9 +210,25 @@ void init(void)
 #endif
 
 
+#ifdef ASSIGN_NEW_IDS
+    assign_unique_ids();
+#endif
+    /* assign other ID parameters needed: before any initialization-time random draw, which is keyed on them */
+
+    if(RestartFlag==0) {for(i = 0; i < NumPart; i++) {P[i].ID_child_number = 0; P[i].ID_generation = 0;}}
+#ifdef NO_CHILD_IDS_IN_ICS
+    if(RestartFlag != 1) {for(i = 0; i < NumPart; i++) {P[i].ID_child_number = 0; P[i].ID_generation = 0;}}
+#endif
+
     for(i = 0; i < NumPart; i++)	/*  start-up initialization */
     {
         P[i].GravAccel = {};
+#ifdef GRAVACCEL_RETAINED_ON_SKIPPED_WALK
+        P[i].GravAccel_Retained = {};
+#endif
+#if defined(GRAIN_EVOLUTION) && (GRAIN_EVOLUTION & 1)
+        P[i].Grain_CoagClaim = 0;   /* no claim is open outside a force pass, so every start begins with none */
+#endif
 
 #ifdef COMPUTE_TIDAL_TENSOR_IN_GRAVTREE /* init tidal tensor for first output (not used for calculation) */
         for(j=0;j<3;j++) {int kt; for(kt=0;kt<3;kt++) {P[i].tidal_tensorps[j][kt]=0;}}
@@ -295,7 +315,8 @@ void init(void)
 #if defined(SINGLE_STAR_FB_WINDS)
             P[i].wind_mode = 0; // this will make single_star_wind_mdot reset it
             P[i].wind_mode_time = All.Time; // mode is undefined above, so the hysteresis is skipped on the first evaluation and this only sets the clock for the one after it
-            Vec3<double> nx,ny,nz; int kw; get_random_orthonormal_basis(P[i].ID,nx,ny,nz); for(kw=0;kw<3;kw++) {P[i].Wind_direction[kw] = nx[kw]; P[i].Wind_direction[kw+3] = ny[kw];}
+            static constexpr uint64_t INITIAL_WIND_BASIS_RNG_SALT = gizmo_loop_rng_salt("initial_wind_basis");
+            Vec3<double> nx,ny,nz; int kw; get_random_orthonormal_basis(i, INITIAL_WIND_BASIS_RNG_SALT, 0, nx,ny,nz); for(kw=0;kw<3;kw++) {P[i].Wind_direction[kw] = nx[kw]; P[i].Wind_direction[kw+3] = ny[kw];}
 #endif
 #endif
 #if defined(GALSF_FB_FIRE_RT_LOCALRP)
@@ -329,7 +350,8 @@ void init(void)
 #if defined(INPUT_READ_SINKPROPS) && defined(SINGLE_STAR_SINK_DYNAMICS)
             if(P[i].Type != 5) /* sink particles have their age read from the IC */
 #endif
-            {P[i].StellarAge = -2.0 * All.InitStellarAgeinGyr / (UNIT_TIME_IN_GYR) * get_random_number(P[i].ID + 3);}
+            {static constexpr uint64_t INITIAL_STELLAR_AGE_RNG_SALT = gizmo_loop_rng_salt("initial_stellar_age");
+             P[i].StellarAge = -2.0 * All.InitStellarAgeinGyr / (UNIT_TIME_IN_GYR) * particle_random_number(i, INITIAL_STELLAR_AGE_RNG_SALT, 0, 0);}
         }
 #endif
         
@@ -343,7 +365,8 @@ void init(void)
             /* Change grain mass to change the distribution of sizes.  Grain_Size_Spectrum_Powerlaw parameter sets d\mu/dln(R_d) ~ R_d^Grain_Size_Spectrum_Powerlaw */
             if(grain_subtype <= 2)
             {
-                P[i].Grain_Size = All.Grain_Size_Min * exp( gizmo_rng_uniform(&random_generator) * log(All.Grain_Size_Max/All.Grain_Size_Min) );
+                static constexpr uint64_t INITIAL_GRAIN_SIZE_RNG_SALT = gizmo_loop_rng_salt("initial_grain_size");
+                P[i].Grain_Size = All.Grain_Size_Min * exp( particle_random_number(i, INITIAL_GRAIN_SIZE_RNG_SALT, 0, 0) * log(All.Grain_Size_Max/All.Grain_Size_Min) );
                 if(All.Grain_Size_Max > All.Grain_Size_Min*1.0001 && fabs(All.Grain_Size_Spectrum_Powerlaw) != 0) {
                     P[i].Mass *= (All.Grain_Size_Spectrum_Powerlaw/(pow(All.Grain_Size_Max/All.Grain_Size_Min,All.Grain_Size_Spectrum_Powerlaw)-1.)) *
                     pow(P[i].Grain_Size/All.Grain_Size_Min,All.Grain_Size_Spectrum_Powerlaw) * log(All.Grain_Size_Max/All.Grain_Size_Min);}
@@ -518,7 +541,8 @@ void init(void)
                 P[i].Sink_Mass_Reservoir = All.SeedReservoirMass;
 #endif
 #ifdef SINK_FOLLOW_ACCRETED_ANGMOM
-                double sink_mu=2*get_random_number(P[i].ID+3)-1, sink_phi=2*M_PI*get_random_number(P[i].ID+4), sink_sin=sqrt(1-sink_mu*sink_mu);
+                static constexpr uint64_t INITIAL_SINK_SPIN_RNG_SALT = gizmo_loop_rng_salt("initial_sink_spin");
+                double sink_mu=2*particle_random_number(i, INITIAL_SINK_SPIN_RNG_SALT, 0, 0)-1, sink_phi=2*M_PI*particle_random_number(i, INITIAL_SINK_SPIN_RNG_SALT, 0, 1), sink_sin=sqrt(1-sink_mu*sink_mu);
                 double spin_prefac = All.G * P[i].Sink_Mass / C_LIGHT_CODE; // assume initially maximally-spinning black hole with random orientation
                 P[i].Sink_Specific_AngMom[0]=spin_prefac*sink_sin*cos(sink_phi); P[i].Sink_Specific_AngMom[1]=spin_prefac*sink_sin*sin(sink_phi); P[i].Sink_Specific_AngMom[2]=spin_prefac*sink_mu;
 #endif
@@ -559,6 +583,10 @@ void init(void)
         CellP[i].ConditionNumber = 1;
         CellP[i].DtInternalEnergy = 0;
         CellP[i].FaceClosureError = 0;
+#ifdef HYDRO_EXPLICITLY_INTEGRATE_VOLUME
+        CellP[i].KernelDensityForVolumeRelaxation = 0; /* set by the first density pass */
+        if(RestartFlag == 2) {CellP[i].Density_ExplicitInt = CellP[i].Density;} /* a snapshot's Density is the integrated density: continue it */
+#endif
 #ifdef ENERGY_ENTROPY_SWITCH_IS_ACTIVE
         CellP[i].MaxKineticEnergyNgb = 0;
 #endif
@@ -586,6 +614,10 @@ void init(void)
         CellP[i].Eta_MHD_OhmicResistivity_Coeff = 0;
         CellP[i].Eta_MHD_HallEffect_Coeff = 0;
         CellP[i].Eta_MHD_AmbiPolarDiffusion_Coeff = 0;
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+        if(RestartFlag != 2) {CellP[i].NonIdealMHDFluxPred = {};} /* starts from zero, except on a snapshot restart, which reads it back (zero if the snapshot lacks it) */
+        CellP[i].NonIdealMHDFluxPred *= gauss2gizmo; CellP[i].NonIdealMHDFlux = CellP[i].NonIdealMHDFluxPred; /* written in Gauss times physical code velocity */
+#endif
 #endif
 #ifdef MHD_BATTERY_MECHANISMS
         CellP[i].DtB_battery_magnitude = 0; /* the hydro pass fills this before the timestep reads it; zero here means no constraint on the first pass */
@@ -715,6 +747,9 @@ void init(void)
         /* the cached composition is not carried in snapshots, so seed it on any start that does not
            restore the cell wholesale. it is refreshed at the first equation-of-state call regardless */
         if(RestartFlag != 1) {CellP[i].Gamma = GAMMA_DEFAULT; CellP[i].MeanMolecularWeight = MEAN_MOLECULAR_WEIGHT_DEFAULT;}
+#if defined(COOLING) && defined(CHIMES)
+        if(RestartFlag != 1 && P[i].Type == 0) {CellP[i].Ne = 0; CellP[i].HI = 1; CellP[i].HII = 0; CellP[i].MolecularMassFraction = 0;} /* neutral and atomic until the abundances are in place; begrun fills the cache from them */
+#endif
 #ifdef EOS_ANCHOR_INTERNALENERGY_IN_DRIFTS
         /* Anchor whatever temperature this run starts from to the energy it belongs to. A binary restart
            keeps the stored pair untouched; anything else has just loaded or seeded Temperature, and the
@@ -820,6 +855,32 @@ void init(void)
         CellP[i].Injected_Sink_Energy = 0;
 #endif
     }
+#ifdef EOS_ELASTIC
+    solid_material_check_cells(); /* every CompositionType is final above: refuse a material the cells carry but that is incomplete */
+#endif
+#if defined(EOS_DAMAGE_POROSITY)
+    /* damage and porosity, before the first density pass evaluates the equation of state (whose P-alpha update would
+     * otherwise read an unset distention). Only a fresh start from a binary IC initializes them: RestartFlag 1 restores
+     * them from the restart files, RestartFlag 2 reads them back from the snapshot, and an HDF5 IC may carry them
+     * (absent datasets read as zero); they are integrated history (Grady-Kipp damage, P-alpha distention, active flaw
+     * count) that cannot be recomputed */
+    for(i = 0; i < N_gas; i++)
+    {
+        if(RestartFlag == 0 && All.ICFormat != 3)
+        {
+            CellP[i].Damage = 0;
+            CellP[i].ActiveCracks = 0;
+            CellP[i].Distention = solid_material_of(CellP[i].CompositionType).InitialDistention; /* alpha_0 per material; 1 = solid */
+        }
+        if(RestartFlag != 1)
+        {
+            /* floor the distention: an absent dataset (an HDF5 IC, or a snapshot written before these fields existed)
+             * reads back as zero, not as alpha_0 */
+            if(!(CellP[i].Distention >= 1.0)) {CellP[i].Distention = solid_material_of(CellP[i].CompositionType).InitialDistention;}
+            if(!(CellP[i].Distention >= 1.0)) {CellP[i].Distention = 1.0;}
+        }
+    }
+#endif
 
 #ifndef BOX_SHEARING
 #if (NUMDIMS==2)
@@ -855,16 +916,6 @@ void init(void)
     }
 #endif
 
-#ifdef ASSIGN_NEW_IDS
-    assign_unique_ids();
-#endif
-    /* assign other ID parameters needed */
-
-    if(RestartFlag==0) {for(i = 0; i < NumPart; i++) {P[i].ID_child_number = 0; P[i].ID_generation = 0;}}
-#ifdef NO_CHILD_IDS_IN_ICS
-    if(RestartFlag != 1) {for(i = 0; i < NumPart; i++) {P[i].ID_child_number = 0; P[i].ID_generation = 0;}}
-#endif
-
 #ifdef TEST_FOR_IDUNIQUENESS
     test_id_uniqueness();
 #endif
@@ -897,8 +948,19 @@ void init(void)
 
     set_softenings();
 
-    /* will build tree */
-    if(force_treebuild_gravity() < 0) {endrun(91569);}
+    /* will build tree.  The status is reduced over all ranks, so every rank stops here together; it has to
+       stop at once, because everything below reads the tree.  Right after a full decomposition neither
+       repair status should occur: -2 means particles sit on a rank that does not own their top-level leaf,
+       -4 that particles lie outside the extent the decomposition measured. */
+    {
+        const int build_status = force_treebuild_gravity();
+        if(build_status < 0)
+        {
+            if(ThisTask == 0) {printf("The initial tree build failed (status %d) right after the initial domain decomposition. Stopping.\n", build_status); fflush(stdout);}
+            endrun(91569);
+            gizmo_exit_bad_stop_if_requested("init:treebuild");
+        }
+    }
 
     All.Ti_Current = 0;
 
@@ -964,35 +1026,21 @@ void init(void)
             CellP[i].CosmicRayEnergyPred[k]=CellP[i].CosmicRayEnergy[k]; CellP[i].CosmicRayDiffusionCoeff[k]=0; CellP[i].DtCosmicRayEnergy[k]=0;
             CellP[i].CosmicRayFlux[k] = {}; CellP[i].CosmicRayFluxPred[k] = {};
 #ifdef CRFLUID_EVOLVE_SCATTERINGWAVES
-            for(j=0;j<2;j++) {CellP[i].CosmicRayAlfvenEnergy[k][j]=0; CellP[i].CosmicRayAlfvenEnergyPred[k][j]=0; CellP[i].DtCosmicRayAlfvenEnergy[k][j]=0;}
+            for(j=0;j<2;j++) /* keep wave energies read from a snapshot (RestartFlag 2); seed absent ones with a small fraction of the CR energy. A fresh start (RestartFlag 0) has no CR energy yet, so they start at 0 and the wave solver applies its own floor */
+            {
+                if(!(CellP[i].CosmicRayAlfvenEnergy[k][j] > 0)) {CellP[i].CosmicRayAlfvenEnergy[k][j] = 1.e-8 * CellP[i].CosmicRayEnergy[k];}
+                CellP[i].CosmicRayAlfvenEnergyPred[k][j]=CellP[i].CosmicRayAlfvenEnergy[k][j]; CellP[i].DtCosmicRayAlfvenEnergy[k][j]=0;
+            }
 #endif
         }
 #endif
 #if defined(EOS_ELASTIC)
-        if(RestartFlag != 1)
-        {
-            CellP[i].Dt_Elastic_Stress_Tensor = CellP[i].Elastic_Stress_Tensor_Pred = CellP[i].Elastic_Stress_Tensor = {};
-        } else {
-            CellP[i].Elastic_Stress_Tensor_Pred = CellP[i].Elastic_Stress_Tensor; CellP[i].Dt_Elastic_Stress_Tensor = {};
-        }
-#endif
-#if defined(EOS_DAMAGE_POROSITY)
-        /* only a fresh start initializes these: RestartFlag 1 restores them from the restart files
-         * and RestartFlag 2 reads them back from the snapshot, and they are integrated history
-         * (Grady-Kipp damage, P-alpha distention, active flaw count) that cannot be recomputed */
-        if(RestartFlag != 1 && RestartFlag != 2)
-        {
-            CellP[i].Damage = 0;
-            CellP[i].ActiveCracks = 0;
-            CellP[i].Distention = All.Tillotson_EOS_params[CellP[i].CompositionType][15]; /* alpha_0 per material; 1 = solid */
-        }
-        if(RestartFlag != 1)
-        {
-            /* floor the distention, which also covers a snapshot restart from a file written before
-             * these fields existed: the absent dataset reads back as zero, not as alpha_0 */
-            if(!(CellP[i].Distention >= 1.0)) {CellP[i].Distention = All.Tillotson_EOS_params[CellP[i].CompositionType][15];}
-            if(!(CellP[i].Distention >= 1.0)) {CellP[i].Distention = 1.0;}
-        }
+        /* the deviatoric stress is evolved history: it comes from the restart files, a snapshot, or an HDF5 IC's StressTensor
+           block (zero if the block is absent); a fresh binary IC does not carry it */
+        if((RestartFlag == 0 && All.ICFormat != 3) || !solid_material_is_elastic(CellP[i].CompositionType)) {CellP[i].Elastic_Stress_Tensor = {};} /* gas carries none, whatever the file holds */
+        CellP[i].Elastic_Stress_Tensor_Pred = CellP[i].Elastic_Stress_Tensor; CellP[i].Dt_Elastic_Stress_Tensor = {};
+        /* the recent-yield memory is evolved history in the same way (a file without the block reads as zero) */
+        if((RestartFlag == 0 && All.ICFormat != 3) || !solid_material_is_elastic(CellP[i].CompositionType) || !(isfinite(CellP[i].RecentYieldMemory) && CellP[i].RecentYieldMemory > 0)) {CellP[i].RecentYieldMemory = 0;} /* a non-finite value read in would switch the correction off for good */
 #endif
         CellP[i].DtInternalEnergy = 0;
 #if defined(COOLING) && !defined(COOLING_OPERATOR_SPLIT)
@@ -1052,9 +1100,14 @@ void init(void)
             CellP[i].grH2II  = 1.0e-20;
 #endif
 #if (COOL_GRACKLE_CHEMISTRY >= 3)
-            CellP[i].grDI    = 2.0 * 3.4e-5;
+            CellP[i].grDI    = 2.0 * 3.4e-5 * HYDROGEN_MASSFRAC; /* grackle's D/H of 2*3.4e-5 is by mass, so the D mass fraction carries X_H */
             CellP[i].grDII   = 1.0e-20;
             CellP[i].grHDI   = 1.0e-20;
+#endif
+#if (COOL_GRACKLE_CHEMISTRY >= 1)
+            /* the electrons and neutral hydrogen of those species, per hydrogen nucleus (charge balance), replacing the ionized default above */
+            CellP[i].Ne = (CellP[i].grHII + CellP[i].grHeII/4. + CellP[i].grHeIII/2.) / HYDROGEN_MASSFRAC;
+            CellP[i].HI = DMAX(0, DMIN(1, CellP[i].grHI / HYDROGEN_MASSFRAC));
 #endif
         }
 #endif
@@ -1250,6 +1303,7 @@ void check_omega(void)
 void setup_smoothinglengths(void)
 {
     int i, no, p;
+    long long n_radius_estimated = 0; /* gas on a snapshot start whose file gave no usable kernel radius */
     if((RestartFlag == 0)||(RestartFlag==2)) // best for stability if we re-calc KernelRadius for snapshot restarts //
     {
 #if defined(DO_DENSITY_AROUND_NONGAS_PARTICLES) || defined(GRAIN_FLUID)
@@ -1267,9 +1321,11 @@ void setup_smoothinglengths(void)
                     no = p;
                 }
 
-                if((RestartFlag == 0)||(P[i].Type != 0)) // if Restartflag==2, use the saved KernelRadius of the gas as initial guess //
+                const int saved_radius_usable = (P[i].KernelRadius > 0) && isfinite(P[i].KernelRadius);
+                if((RestartFlag == 0)||(P[i].Type != 0)||(!saved_radius_usable)) // if Restartflag==2, use the saved KernelRadius of the gas as initial guess, when the file had one //
                 {
 #ifndef INPUT_READ_KERNELRADIUS
+                    if((RestartFlag == 2) && (P[i].Type == 0)) {n_radius_estimated++;}
 #if NUMDIMS == 3
                     P[i].KernelRadius = pow(3.0 / (4 * M_PI) * All.DesNumNgb * P[i].Mass / Nodes[no].u.d.mass, 0.333333) * Nodes[no].len;
 #endif
@@ -1305,8 +1361,13 @@ void setup_smoothinglengths(void)
                     }
 #endif
 #endif // INPUT_READ_KERNELRADIUS
-                } // closes if((RestartFlag == 0)||(P[i].Type != 0))
+                } // closes if((RestartFlag == 0)||(P[i].Type != 0)||(!saved_radius_usable))
             }
+    }
+    if(RestartFlag == 2)
+    {
+        sumup_longs(1, &n_radius_estimated, &n_radius_estimated);
+        if((ThisTask == 0) && (n_radius_estimated > 0)) {printf("Snapshot start: %lld gas cells had no usable kernel radius in the file; estimated from the tree as for a fresh start.\n", n_radius_estimated);}
     }
     if((RestartFlag==0 || RestartFlag==2) && All.ComovingIntegrationOn) {for(i=0;i<N_gas;i++) {P[i].KernelRadius *= pow(All.OmegaMatter/All.OmegaBaryon,1./NUMDIMS);}} /* correct (crudely) for baryon fraction, used in the estimate above for KernelRadius */
 

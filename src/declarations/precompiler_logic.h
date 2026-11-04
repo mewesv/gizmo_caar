@@ -61,7 +61,7 @@
 #endif
 
 #if defined(EOS_DAMAGE_POROSITY)
-/* damage + porosity bitfield (bit 0 Grady-Kipp, bit 1 Drucker-Prager, bit 2 P-alpha Jutzi) auto-implies elastic+Tillotson machinery */
+/* damage + porosity bitfield (bit 0 fracture damage, bit 1 Drucker-Prager, bit 2 P-alpha Jutzi) auto-implies elastic+Tillotson machinery */
 #ifndef EOS_TILLOTSON
 #define EOS_TILLOTSON
 #endif
@@ -228,6 +228,17 @@
 #if defined(COOL_GRACKLE) && !defined(COOLING)
 #define COOLING
 #endif
+/* a chemistry library that tracks species hands each cell's result to the shared cache (store_solved_chemistry in cell_data.h), which is
+   where every other module reads it: the species fractions, and for molecular networks the H2 fraction. A new library defines these two */
+#if defined(CHIMES) || (defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY >= 1))
+#define EXTERNAL_CHEMISTRY_REPORTS_SPECIES
+#endif
+#if defined(CHIMES) || (defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY >= 2))
+#define EXTERNAL_CHEMISTRY_REPORTS_H2
+#endif
+#if defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY >= 2)
+#define EOS_CHEMISTRY_PROVIDES_GAMMA /* the chemistry library evolves the molecules and stores the adiabatic index of the state it solved, and the equation of state uses it */
+#endif
 
 
 
@@ -267,11 +278,13 @@
 #endif
 
 #if (FIRE_PHYSICS_DEFAULTS == 3)
-#if !defined(CHIMES) /* CHIMES evolves its own chemistry and does not carry the electron fraction this model reads */
+#if !defined(CHIMES) && !defined(COOL_GRACKLE) /* CHIMES and Grackle replace the default network this model belongs to: its molecules would not match the composition they cache */
 #define COOL_MOLECFRAC_NONEQM
 #endif
 #define OUTPUT_MOLECULAR_FRACTION
+#if !defined(CHIMES) /* the net cooling rate it writes is a query of the in-code network, which CHIMES replaces */
 #define OUTPUT_COOLRATE
+#endif
 #if !(defined(RT_OTVET) || defined(RT_FLUXLIMITEDDIFFUSION) || defined(RT_M1) || defined(RT_LOCALRAYGRID))
 #define RT_USE_GRAVTREE_SAVE_RAD_FLUX  /* LEBRON-style gravtree flux save; mutex with explicit RT solvers (same reasoning as the GALSF_FB_FIRE_RT_* / SINK_*_HEATING blocks) */
 #endif
@@ -591,7 +604,7 @@
 #endif
 #ifdef COOLING
 #define SIMPLE_STEADYSTATE_CHEMISTRY
-#if !defined(CHIMES) /* not compatible with CHIMES, which evolves its own chemistry */
+#if !defined(CHIMES) && !defined(COOL_GRACKLE) /* not compatible with CHIMES or Grackle, which replace the default network this model belongs to */
 #define COOL_MOLECFRAC_NONEQM
 #endif
 #define EOS_SUBSTELLAR_ISM
@@ -949,13 +962,13 @@
 
 
 #if defined(COOL_MOLECFRAC)
-#if (COOL_MOLECFRAC == 6) && !defined(COOL_MOLECFRAC_NONEQM) && !defined(CHIMES)
+#if (COOL_MOLECFRAC == 6) && !defined(COOL_MOLECFRAC_NONEQM) && !defined(CHIMES) && !defined(COOL_GRACKLE)
 #define COOL_MOLECFRAC_NONEQM // estimate molecular fractions for thermochemistry+cooling with explicitly-evolved non-equilibirum H2 formation+destruction with clumping and self-shielding (Hopkins et al arXiv:2203.00040)
 #endif
 #endif
 
 
-#if defined(EOS_SUBSTELLAR_ISM) || defined(COOL_MOLECFRAC_NONEQM)
+#if defined(EOS_SUBSTELLAR_ISM) || defined(COOL_MOLECFRAC_NONEQM) || defined(EOS_CHEMISTRY_PROVIDES_GAMMA)
 #define EOS_GAMMA_VARIABLE
 #endif
 
@@ -1018,6 +1031,19 @@
 
 
 
+#if defined(CHIMES_HII_REGIONS) && !defined(GALSF_FB_FIRE_RT_HIIHEATING)
+#define GALSF_FB_FIRE_RT_HIIHEATING // must be on, this module uses the same code
+#endif
+#if defined(CHIMES) && defined(GALSF_FB_FIRE_RT_HIIHEATING) && !defined(CHIMES_HII_REGIONS)
+#define CHIMES_HII_REGIONS // with CHIMES, the HII-region heating acts through CHIMES (the default model assumes the in-code network's composition)
+#endif
+#if defined(CHIMES_HII_REGIONS) && !defined(CHIMES_STELLAR_FLUXES)
+#define CHIMES_STELLAR_FLUXES // the HII regions pass CHIMES the stellar fluxes in its age bins
+#endif
+#if defined(CHIMES_STELLAR_FLUXES) && !defined(GALSF_FB_FIRE_RT_LONGRANGE)
+#define GALSF_FB_FIRE_RT_LONGRANGE // the stellar fluxes CHIMES reads come from FIRE's long-range radiation (its luminosity tree and bands)
+#endif
+
 /* ----- giant block of options for RHD modules ------ */
 
 /* options for FIRE RT method */
@@ -1041,6 +1067,18 @@
    mesh/compute_finitevol_faces.cc can be retargeted; for neutrinos use multigroup-M1. */
 #ifdef RT_DIFFUSION_IMPLICIT
 #error "RT_DIFFUSION_IMPLICIT has been retired. Use RT_M1 with subcycling (TRANSPORT_SUBCYCLE) instead."
+#endif
+
+/* The counts from which work moves to the device are parameterfile parameters now; a Config.sh line that still sets one
+   of the old compile-time values would be ignored without this. */
+#ifdef GPU_MIN_PARTICLES_FOR_OFFLOAD
+#error "GPU_MIN_PARTICLES_FOR_OFFLOAD has been replaced by the parameterfile parameter GPUParticleLoopOffloadMinCount (or GPUElementOffloadMinCount for all per-particle loops and the drift). Remove it from Config.sh."
+#endif
+#ifdef GPU_MIN_PARTICLES_FOR_DRIFT_OFFLOAD
+#error "GPU_MIN_PARTICLES_FOR_DRIFT_OFFLOAD has been replaced by the parameterfile parameter GPUDriftOffloadMinCount. Remove it from Config.sh."
+#endif
+#ifdef GPU_MIN_SOURCES_FOR_WALK_OFFLOAD
+#error "GPU_MIN_SOURCES_FOR_WALK_OFFLOAD has been replaced by the parameterfile parameter GPUTreeWalkOffloadMinCount (or GPUTreeOffloadMinCount for the walk, the gravity walk and the spatial-index builds together). Remove it from Config.sh."
 #endif
 
 /* options for FLD or OTVET or M1 or Ray/Rad_Intensity modules */
@@ -1126,12 +1164,41 @@
 #ifndef RT_SPEEDOFLIGHT_REDUCTION
 #define RT_SPEEDOFLIGHT_REDUCTION (1.0)
 #endif
+
+/* non-ideal MHD: MHD_NON_IDEAL (bare or =1) solves the non-ideal terms as diffusive fluxes; MHD_NON_IDEAL=2 instead evolves the
+   non-ideal electric field explicitly with a reduced speed of light. The reduced speed defaults to the one already used by an
+   explicit radiation solver, else by cosmic rays, else the true speed of light. */
+#ifdef MHD_NON_IDEAL
+#if !((MHD_NON_IDEAL+0 == 0) || (MHD_NON_IDEAL+0 == 1) || (MHD_NON_IDEAL+0 == 2))
+#error "MHD_NON_IDEAL must be set bare, =1 (diffusive non-ideal fluxes) or =2 (evolved non-ideal electric field)"
+#endif
+#if (MHD_NON_IDEAL+0 == 2)
+#define MHD_NON_IDEAL_EVOLVED_FLUX
+#if !defined(MHD_NON_IDEAL_SPEEDOFLIGHT_REDUCTION)
+#if defined(RT_SOLVER_EXPLICIT)
+#define MHD_NON_IDEAL_SPEEDOFLIGHT_REDUCTION (RT_SPEEDOFLIGHT_REDUCTION)
+#elif defined(COSMIC_RAY_FLUID)
+#define MHD_NON_IDEAL_SPEEDOFLIGHT_REDUCTION (CRFLUID_SPEEDOFLIGHT_REDUCTION)
+#else
+#define MHD_NON_IDEAL_SPEEDOFLIGHT_REDUCTION (1.0)
+#endif
+#endif
+#endif
+#endif
 #if (defined(RADTRANSFER) || defined(RT_USE_GRAVTREE) || defined(RT_SOURCE_INJECTION)) && !defined(RT_SOURCES) /* only radiation code reads the source types */
 #define RT_SOURCES 1+2+4+8+16+32 // default to allowing all types to act as sources //
 #endif
 
 #if !defined(RT_USE_GRAVTREE) && defined(RT_SELFGRAVITY_OFF) && !defined(SELFGRAVITY_OFF)
 #define SELFGRAVITY_OFF // safely define SELFGRAVITY_OFF in this case, otherwise we act like there is gravity except in the final setting of accelerations
+#endif
+
+/* a particle whose tree walk is skipped keeps the acceleration the gravity call finalized (tree, analytic, direct terms) and
+   advances it with the jerk. Forces added to GravAccel after the gravity call (drag and grain radiation under the drag flag, quantum pressure) must
+   then not ride along on the kept value, so it is kept apart in GravAccel_Retained. Any new force added to GravAccel after
+   gravity must join this list. */
+#if defined(ADAPTIVE_TREEFORCE_UPDATE) && !defined(SELFGRAVITY_OFF) && !defined(RT_SELFGRAVITY_OFF) && (defined(DO_FLUID_ALTSPECIES_DRAG_CALCULATION) || defined(DM_FUZZY))
+#define GRAVACCEL_RETAINED_ON_SKIPPED_WALK
 #endif
 
 /* turn on outputs appropriately */
@@ -1165,6 +1232,8 @@
 
 #ifdef RT_CHEM_PHOTOION
 #define RT_BAND_IS_IONIZING(k) ((k==RT_FREQ_BIN_H0) || (k==RT_FREQ_BIN_He0) || (k==RT_FREQ_BIN_He1) || (k==RT_FREQ_BIN_He2))
+#else
+#define RT_BAND_IS_IONIZING(k) (0) /* no ionizing bands without photo-ionization chemistry */
 #endif
 
 #ifndef GALSF_FB_FIRE_RT_LONGRANGE
@@ -1456,6 +1525,15 @@
 #endif
 #endif // GRAIN_FLUID_PROMOTION
 
+/* gas+solid builds: a solid cell beside gas deforms with its own material (hydro/gradients_loop.cc). Its stress rate (EOS_ELASTIC)
+   and, where cell volumes are integrated (MFM), its volume use the velocity gradient of its solid neighbours, while gas keeps its kernel density */
+#if defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS) && (defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS)) && defined(HYDRO_EXPLICITLY_INTEGRATE_VOLUME) && defined(HYDRO_MESHLESS_FINITE_MASS) && !defined(HYDRO_SPH)
+#define SOLID_VOLUME_FROM_SOLID_NEIGHBOURS
+#endif
+#if defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS) && (defined(EOS_ELASTIC) || defined(SOLID_VOLUME_FROM_SOLID_NEIGHBOURS))
+#define SOLID_OWN_VELOCITY_GRADIENT
+#endif
+
 
 
 /* block for metals and other passive scalars, should stay in this order. like the RHD, probably a more elegant way to do this with functions, but designed here to use compiler logic instead */
@@ -1595,9 +1673,6 @@
 #endif
 
 
-#if defined(CHIMES_HII_REGIONS) && !defined(GALSF_FB_FIRE_RT_HIIHEATING)
-#define GALSF_FB_FIRE_RT_HIIHEATING // must be on, this module uses the same code
-#endif
 #ifdef CHIMES_STELLAR_FLUXES /* The following defines the stellar age bins that we will use to define the UV spectra from stars used in CHIMES. */
 #define CHIMES_LOCAL_UV_NBINS 8
 #define CHIMES_LOCAL_UV_AGE_LOW 0.0
@@ -1615,6 +1690,10 @@
 
 #if defined(GALSF_EFFECTIVE_EQS) && defined(GALSF_SFR_CRITERION) && (GALSF_SFR_CRITERION != 0)
 #error "GALSF_EFFECTIVE_EQS requires GALSF_SFR_CRITERION=0; molecular/virial/etc. criteria are not defined for this model (molecular fraction is undefined in the effective EOS)."
+#endif
+
+#if defined(GALSF_SUBGRID_WINDS) && !defined(GALSF_EFFECTIVE_EQS)
+#error "GALSF_SUBGRID_WINDS requires GALSF_EFFECTIVE_EQS; the wind energy and speed are normalized by the effective-EOS supernova energy (FactorSN, EgySpecSN), which exists only with that model."
 #endif
 
 
@@ -1796,4 +1875,9 @@
 #error "EOS_SUBSTELLAR_ISM anchors the cached energy-to-temperature conversion, which requires every writer of the cached temperature to update its anchor alongside. Grackle, Helmholtz, ANEOS, Tillotson, elastic and mixed gas/solid equations of state each set that temperature from a solver the cache cannot follow, and the table dispatch is per-cell, so the combination is refused rather than reading a stale anchor. CHIMES is excluded by the gate above rather than here."
 #endif
 #define EOS_ANCHOR_INTERNALENERGY_IN_DRIFTS
+#endif
+
+/* last, after every block that can switch on an equation of state (GRAIN_FLUID_PROMOTION turns on EOS_TILLOTSON above) */
+#if defined(HYDRO_KERNEL_SURFACE_VOLCORR) && (defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS))
+#define KERNEL_SURFACE_VOLCORR_MATERIAL_AWARE /* cells carry a CompositionType: the surface correction stands down at material interfaces (mesh/kernel.h) */
 #endif

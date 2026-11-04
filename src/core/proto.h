@@ -19,8 +19,8 @@
  */
 
 
-void write_header_attributes_in_hdf5(hid_t handle);
-void read_header_attributes_in_hdf5(char *fname);
+void write_header_attributes_in_hdf5(hid_t handle, const long long *npart_this_file);
+int read_header_attributes_in_hdf5(char *fname);   /* 0 on success; nonzero if the file or its Header group cannot be opened */
 
 void output_compile_time_options(void);
 const char *compile_time_config_literal(void);              /* the Config.sh lines, one per line */
@@ -38,11 +38,14 @@ void init_turb(void);
 void set_turb_ampl(void);
 int new_turbforce_needed_this_timestep(void);
 void add_turb_accel(void);
+void turb_accel_refresh_for_new_step(int i, integertime ti_previous_step_start);
 void log_turb_temp(void);
-double get_random_number(MyIDType id);
+uint64_t particle_event_rng_key(int i);
+double particle_random_number(int i, uint64_t site_salt, uint64_t event, uint64_t draw_index);
 double mpi_report_comittable_memory(long long BaseMem, int verbose);
 int report_node_memory_headroom(long long *avail_kb, long long *commit_headroom_kb);
 int gizmo_node_headroom_admits(long long bytes_this_rank);
+int gizmo_device_has_room(size_t bytes, double fraction);
 void gizmo_kept_list_grow(long long delta_bytes);
 void gizmo_kept_list_note_refused(long long bytes);
 long long report_comittable_memory(long long *MemTotal,
@@ -55,7 +58,7 @@ int does_particle_need_to_be_merged(int i);
 int does_particle_need_to_be_split(int i);
 double target_mass_renormalization_factor_for_mergesplit(int i, int split_key);
 #if defined(FIRE_SUPERLAGRANGIAN_JEANS_REFINEMENT) || defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
-int check_if_sufficient_mergesplit_time_has_passed(int i, gizmo_rng_t *rng);
+int check_if_sufficient_mergesplit_time_has_passed(int i);
 int is_particle_a_special_zoom_target(int i);
 #endif
 #ifdef SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM_TAG_ANCHOR
@@ -65,8 +68,34 @@ int merge_particles_ij(int i, int j);
 int split_particle_i(int i, int n_particles_split, double r_near);
 void do_first_halfstep_kick(void);
 void do_second_halfstep_kick(void);
-double matrix_invert_ndims(Mat3<double>& T, Mat3<double>& Tinv);
-double matrix_invert_ndims(double T[3][3], double Tinv[3][3]);
+/* routine to invert square matrices of side Ndims x Ndims, used in a number of places in code for e.g. gradients, etc.
+   Callable on host and device, so the per-particle solvers that use it run unchanged in either place. */
+GIZMO_GPU_FUNCTION static inline double matrix_invert_ndims(Mat3<double>& T, Mat3<double>& Tinv)
+{
+    double FrobNorm = T.frobenius_norm_sq(); /* Frobenius norm of T */
+    Tinv = Mat3<double>{}; /* initialize Tinv to null */
+#if (NUMDIMS==1) /* one-dimensional case */
+    double detT = T[0][0]; if((detT != 0) && !isnan(detT)) {Tinv[0][0] = 1./detT;} else {Tinv[0][0]=1;} /* only one non-trivial element in 1D! */
+#elif (NUMDIMS==2) /* two-dimensional case */
+    double detT = T[0][0]*T[1][1] - T[0][1]*T[1][0];
+    if((detT != 0) && !isnan(detT))
+    {
+        Tinv[0][0] =  T[1][1] / detT; Tinv[0][1] = -T[0][1] / detT;
+        Tinv[1][0] = -T[1][0] / detT; Tinv[1][1] =  T[0][0] / detT;
+    }
+#else /* three-dimensional case */
+    double detT = T.invert(Tinv);
+#endif
+    double FrobNorm_inv = Tinv.frobenius_norm_sq(); /* Frobenius norm of inverse matrix */
+    double ConditionNumber = DMAX( sqrt(FrobNorm*FrobNorm_inv) / NUMDIMS , 1 ); /* this = sqrt( ||T^-1||*||T|| ) :: should be ~1 for a well-conditioned matrix */
+    (void)detT;
+    return ConditionNumber;
+}
+/* legacy overload accepting raw arrays -- forwards to the Mat3 version */
+GIZMO_GPU_FUNCTION static inline double matrix_invert_ndims(double T[3][3], double Tinv[3][3])
+{
+    return matrix_invert_ndims(*reinterpret_cast<Mat3<double>*>(T), *reinterpret_cast<Mat3<double>*>(Tinv));
+}
 #ifdef HERMITE_INTEGRATION
 GIZMO_GPU_FUNCTION int eligible_for_hermite(int i, struct particle_data *pp); /* definition in core/timestep_functions.h (single source of truth) */
 void do_hermite_prediction(void);
@@ -234,6 +263,11 @@ GIZMO_GPU_FUNCTION static inline double molecular_weight_estimator_for_gas_aroun
     return 1. / DMAX(0.1, 0.80125 + f_i - 0.37 * f_mol);
 #endif
 }
+/* the squared thermal sound speed of the gas around a grain, from its carried temperature and ionized fraction */
+GIZMO_GPU_FUNCTION static inline double gas_soundspeed2_around_grain(double gas_temperature, double f_ion)
+{
+    return GAMMA_DEFAULT * gas_temperature / (molecular_weight_estimator_for_gas_around_grain(gas_temperature, f_ion) * U_TO_TEMP_UNITS);
+}
 
 static inline double c_light_code_reduced(int k_freq, struct particle_data *pp, struct gas_cell_data *cell) {
 #if defined(RT_FLUXLIMITER)
@@ -259,22 +293,22 @@ GIZMO_GPU_FUNCTION inline double sigmoid_sqrt(double x) {return 0.5*(1 + x/sqrt(
    Jeans-refinement / grain-fluid builds where those types are reserved for
    non-stellar roles (analytic-BH anchor; grains, GRAIN_PTYPES defaults to type 3).
    Callers apply their own Mass>0 / KernelRadius>0 / age guards on top. */
-/*! Transient claim token for the sink accretion/merger protocol: which sink has claimed a given
- *  particle this step. It replaces the particle ID there, which cannot do the job -- IDs repeat
- *  (every spawned wind cell carries one stamped value, and an input can hold duplicates), so two
- *  sinks sharing an ID were indistinguishable to the claim, the owner match and the cross-rank
- *  arbitration alike.
+/*! Transient claim token for the claim-then-consume protocols (sink accretion/merger, grain
+ *  coagulation): which particle has claimed a given particle this step. It replaces the particle ID
+ *  there, which cannot do the job -- IDs repeat (every spawned wind cell carries one stamped value,
+ *  and an input can hold duplicates), so two claimants sharing an ID were indistinguishable to the
+ *  claim, the owner match and the cross-rank arbitration alike.
  *
- *  The owning rank and the slot the sink occupies on it are EXACTLY unique for a given particle
+ *  The owning rank and the slot the claimant occupies on it are EXACTLY unique for a given particle
  *  layout, so no hashing and no collision handling are needed. The token is formed on the owner and
  *  carried in the transported record, so a remote evaluation compares the same value; it stays valid
- *  because nothing reorders particles between the feed pass that writes a claim and the swallow pass
- *  that consumes it. The +1 keeps it clear of the 0 that means "unclaimed".
+ *  because nothing reorders particles between the pass that writes a claim and the pass that
+ *  consumes it. The +1 keeps it clear of the 0 that means "unclaimed".
  *
  *  It is a token, NOT an identity: P[].ID remains what identifies a particle for physics and output.
  *  Ordering comparisons on it (the arbitration among competing claims) stay well defined, but select
  *  the largest TOKEN rather than the largest ID -- an arbitrary tie-break either way. */
-GIZMO_GPU_FUNCTION static inline MyIDType gizmo_sink_claim_token(int owner_task, int owner_slot)
+GIZMO_GPU_FUNCTION static inline MyIDType gizmo_claim_token(int owner_task, int owner_slot)
 {
     return (MyIDType)1 + (((MyIDType)(unsigned int)owner_task << 32) | (MyIDType)(unsigned int)owner_slot);
 }
@@ -356,9 +390,27 @@ GIZMO_GPU_FUNCTION double return_user_desired_target_pressure(int i, struct part
 #ifdef EOS_TILLOTSON
 void tillotson_eos_init(void);
 #endif
+#ifdef EOS_ELASTIC
+void solid_material_resolve(void);
+void solid_material_check_cells(void);
+#endif
 #ifdef EOS_ANEOS
 #include "../eos/aneos.h"
+/* the lowest specific internal energy [code units] at which a cell's material has a valid equation of state at density rho
+   [code units]: for a table material, the energy at the table's lowest valid temperature there; 0 (no bound) otherwise */
+GIZMO_GPU_FUNCTION static inline double lowest_valid_internal_energy(const struct aneos_table *aneos_tables, int composition_type, double rho)
+{
+    if(!aneos_tables || eos_branch_of(composition_type) != EOS_BRANCH_ANEOS) {return 0;}
+    return aneos_min_specific_energy(aneos_tables, aneos_subindex(composition_type), rho * UNIT_DENSITY_IN_CGS) / UNIT_SPECEGY_IN_CGS;
+}
 #endif
+/* the positivity catch on a specific internal energy update u_old -> u_new: the energy halves when the update would take it
+   below half; and where the material has a lowest valid energy u_floor > 0, the result is never below that (0: no bound) */
+GIZMO_GPU_FUNCTION static inline double internal_energy_positivity_catch(double u_old, double u_new, double u_floor)
+{
+    double u = (u_new < 0.5*u_old) ? 0.5*u_old : u_new;
+    return (u_floor > 0 && u < u_floor) ? u_floor : u;
+}
 
 #ifdef SPECIAL_POINT_WEIGHTED_MOTION
 double weight_function_for_weighted_motion_smoothing(double r, int mode);
@@ -426,6 +478,34 @@ void report_memory_ledger(const char *when);
 void report_memory_ledger_on_growth(const char *when);
 int gizmo_memory_preflight(void);
 void gizmo_nlr_report_dispatch_thresholds(void);   /* rank 0 prints the resolved neighbour-loop Mode B/D thresholds */
+/* The work a device takes over from the host is chosen by a per-MPI-task count: below it the work stays on the host,
+ * at or above it the device takes it (0: the device whenever there is any work).  gizmo_gpu_offload_min_count resolves each from the
+ * parameter file (core/begrun.cc), so every reader of a count and the startup report agree on its value. */
+enum GizmoOffloadSite
+{
+    GPU_OFFLOAD_PARTICLE_LOOP = 0,    /* elements in a per-particle loop: cooling, nuclear network, turbulence driving, RT chemistry, grain drag, CBE integrator */
+    GPU_OFFLOAD_DRIFT,                /* particles that need a drift */
+    GPU_OFFLOAD_TREE_WALK,            /* sources in one batch of a neighbour-loop tree walk; the fewest actives Mode D takes on its busiest rank */
+    GPU_OFFLOAD_GRAVITY_WALK,         /* active gravity candidates; fewer are walked on the host */
+    GPU_OFFLOAD_SIDX_OWNED_PRESORTED, /* members of a spatial-index build over the rank's own particles, already in order */
+    GPU_OFFLOAD_SIDX_OWNED_SORTED,    /* members of a spatial-index build over the rank's own particles, to be sorted */
+    GPU_OFFLOAD_SIDX_IMPORTED,        /* members of a spatial-index build over imported particles */
+    GPU_OFFLOAD_NUM_SITES
+};
+int gizmo_gpu_offload_min_count(enum GizmoOffloadSite site);
+int gizmo_gpu_offload_takes(enum GizmoOffloadSite site, long long count);   /* 1 if `count` work items go to the device: at least the site's count, and never an empty batch */
+void gizmo_gpu_offload_report(void);   /* rank 0 prints every resolved count and where it came from, the host-thread counts below included */
+/* A host loop runs on all OpenMP threads only from a per-MPI-task count of items, below which starting the threads costs more than
+ * the loop.  One anchor, HostThreadMinCount, sets the count of each kind of loop below (core/begrun.cc), scaled by how much work an item is. */
+enum GizmoHostThreadSite
+{
+    HOST_THREAD_PARTICLE_LOOP = 0,    /* one element per item: drift, the gradient and corridor passes over active gas, subcycled transport, sink properties */
+    HOST_THREAD_NEIGHBOUR_WORK,       /* neighbour-loop walks, evaluations and writebacks run on the host */
+    HOST_THREAD_BOOKKEEPING,          /* a few arithmetic operations or a copy per item: the turbulence energy tracking and compact staging */
+    HOST_THREAD_NUM_SITES
+};
+int gizmo_host_threads_take(enum GizmoHostThreadSite site, long long count);   /* 1 if a loop over `count` items should run on all OpenMP threads */
+int gizmo_host_thread_count(void);   /* the OpenMP threads a host loop would run on (1 without OpenMP) */
 void gizmo_size_memory_arena(void);   /* sets All.WorkingMemoryPoolSize from what will draw on the pool, unless the parameter file asked for a size; call once, before mymalloc_init */
 #ifdef PMGRID
 /* Arena bytes the long-range mesh will want, for startup sizing, split into what it holds for the
@@ -459,6 +539,7 @@ enum {
   GIZMO_KOKBUCKET_NGL_SIDX,             /* label prefix ngl_sidx_  (tile/BVH/pool/compact-position spatial index) */
   GIZMO_KOKBUCKET_NGL_PAIRS,            /* label prefix ngl_pairs_ (per-dispatch active list, CSR offsets/neighbours, search scratch) */
   GIZMO_KOKBUCKET_NGL_PACKET,           /* label prefix ngl_packet_ (the fused neighbour walk's packet workspace, kept between calls) */
+  GIZMO_KOKBUCKET_NGL_MODE_D_CALL,      /* label prefix ngl_moded_ (a device-resident neighbour call's workspace, held for that call, and its persistent pinned staging) */
   GIZMO_KOKBUCKET_NGL,                  /* label prefix ngl_ (remaining neighbour-list memory: build/refresh scratch) */
   GIZMO_KOKBUCKET_MG_GRAPH,             /* label prefix mg_graph_  (MG div(B) face graph, its per-row values and build scratch) */
   GIZMO_KOKBUCKET_MG_INSERT,            /* label prefix mg_insert_ (MG solver insertion arrays, freed once HYPRE has assembled) */
@@ -488,12 +569,15 @@ extern "C" const char *gizmo_kokkos_mem_unknown_space_name(void);  /* first unre
 extern "C" void *gizmo_gpu_alloc_shared(size_t nbytes, const char *label);   /* SharedSpace/UVM: host- and device-readable */
 extern "C" void *gizmo_gpu_alloc_device(size_t nbytes, const char *label);   /* device-only memory */
 extern "C" void *gizmo_gpu_alloc_host(size_t nbytes, const char *label);     /* host memory obtained through Kokkos */
+extern "C" void *gizmo_gpu_alloc_pinned_host(size_t nbytes, const char *label);   /* page-locked host memory: device copies and MPI run at full speed from it */
+extern "C" void  gizmo_gpu_free_pinned_host(void *ptr);                            /* releases gizmo_gpu_alloc_pinned_host memory */
 extern "C" void  gizmo_gpu_free_device(void *ptr);                                              /* releases gizmo_gpu_alloc_device memory */
 extern "C" void  gizmo_gpu_copy_to_device(void *dst_device, const void *src_host, size_t nbytes); /* blocking bulk copies between */
 extern "C" void  gizmo_gpu_copy_to_host(void *dst_host, const void *src_device, size_t nbytes);   /* host and device-only memory (waits for all device work first) */
 /* 1 when the particle storage is CUDA managed memory, which MPI must not receive into directly: such receives go
    through host staging (MPI_Sendrecv_into_particle_storage, the ghost transport).  0 on HIP and host builds. */
 extern "C" int gizmo_particle_storage_needs_staged_mpi_receive(void);
+extern "C" int gizmo_particle_storage_device_reads_in_place(void);   /* 1 if device kernels can work on scattered particle records in place (coherent memory or device-preferred storage) */
 /* Tree-array byte breakdown at the current allocation (forcetree.cc provider; zeros when
    no tree is allocated). Foreign "used" is the since-start high-water of Numforeignnodes
    (current-at-print is misleading: force_treeallocate resets it before a stop ledger).
@@ -592,7 +676,7 @@ double Get_CosmicRayGradientLength(int i, int k_CRegy, struct particle_data *pp,
 GIZMO_GPU_FUNCTION double CosmicRay_Update_DriftKick(int i, double dt_entr, int mode, struct particle_data *pp, struct gas_cell_data *cell);
 GIZMO_GPU_FUNCTION double CR_energy_spectrum_injection_fraction(int k_CRegy, int source_type, double shock_vel, int return_index_in_bin, int target, struct particle_data *pp, struct gas_cell_data *cell);
 GIZMO_GPU_FUNCTION double return_cosmic_ray_anisotropic_closure_function_threechi(int target, int k_CRegy, struct gas_cell_data *cell);
-GIZMO_GPU_FUNCTION void inject_cosmic_rays(double CR_energy_to_inject, double injection_velocity, int source_type, int target, double *dir, struct particle_data *pp, struct gas_cell_data *cell);
+GIZMO_GPU_FUNCTION void inject_cosmic_rays(double CR_energy_to_inject, double injection_velocity, int source_type, int target, double *dir, struct particle_data *pp, struct gas_cell_data *cell, int mode);
 GIZMO_GPU_FUNCTION double evaluate_cr_transport_reductionfactor(int target, int k_CRegy, int mode, struct gas_cell_data *cell);
 double Get_AlfvenMachNumber_Local(int i, double vA_idealMHD_codeunits, int use_shear_corrected_vturb_flag, struct gas_cell_data *cell);
 double diffusion_coefficient_constant(int target, int k_CRegy, struct gas_cell_data *cell);
@@ -627,6 +711,7 @@ GIZMO_GPU_FUNCTION double return_CRbin_kinetic_energy_in_GeV_binvalsNRR(int k_CR
 #endif
 #ifdef EOS_ELASTIC
 void elastic_body_update_driftkick(int i, double dt_entr, int mode);
+void elastic_stress_rate(int i, const double velocity_gradient[3][3]);
 #endif
 #if defined(EOS_ELASTIC) || defined(EOS_TILLOTSON) || defined(EOS_ANEOS)
 GIZMO_GPU_FUNCTION double get_negative_pressure_tensilecorrfac(double r, double h_i, double h_j);
@@ -672,7 +757,7 @@ double INLINE_FUNC hubble_function_external(double a);
 
 void sink_accretion(void);
 #ifdef SINK_WIND_SPAWN
-void get_random_orthonormal_basis(int seed, Vec3<double>& nx, Vec3<double>& ny, Vec3<double>& nz);
+void get_random_orthonormal_basis(int i, uint64_t site_salt, uint64_t event, Vec3<double>& nx, Vec3<double>& ny, Vec3<double>& nz);
 void get_wind_spawn_direction(int i, int num_spawned_this_call, int mode, Vec3<double>& ny, Vec3<double>& nz, Vec3<double>& veldir, Vec3<double>& dpdir);
 double get_spawned_cell_launch_speed(int i, struct particle_data *pp);
 #ifdef MAGNETIC
@@ -702,7 +787,7 @@ void get_dataset_name_legacy_alias(enum iofields blocknr, char *buf);
 int blockpresent(enum iofields blocknr);
 void fill_write_buffer(enum iofields blocknr, int *pindex, int pc, int type);
 void empty_read_buffer(enum iofields blocknr, int offset, int pc, int type);
-long get_particles_in_block(enum iofields blocknr, int *typelist);
+long long get_particles_in_block(enum iofields blocknr, int *typelist, const long long *npart_in_file);
 int get_bytes_per_blockelement(enum iofields blocknr, int mode);
 size_t get_input_float_bytes(enum iofields blocknr);
 int read_file(char *fname, int readTask, int lastTask);
@@ -1091,6 +1176,7 @@ GIZMO_GPU_FUNCTION double cr_get_source_shieldfac(int i, struct particle_data *p
 #ifdef CHIMES
 double chimes_convert_u_to_temp(double u, double rho, int target, struct particle_data *pp, struct gas_cell_data *cell);
 void chimes_update_gas_vars(int target, struct particle_data *pp, struct gas_cell_data *cell);
+void chimes_cache_solved_state(int target, double u_code, struct gas_cell_data *cell);
 void chimes_gizmo_exit(void);
 #ifdef COOL_METAL_LINES_BY_SPECIES
 void chimes_update_element_abundances(int i, struct particle_data *pp, struct gas_cell_data *cell);
@@ -1103,6 +1189,9 @@ void chimes_init_depletion_data(void);
 void chimes_compute_depletions(double nH, double T, int thread_id);
 #endif
 #else
+#endif
+#if defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY > 0)
+void grackle_cache_species_state(int target);
 #endif
 void cooling_parent_routine(void);
 #ifdef NUCLEAR_NETWORK
@@ -1141,7 +1230,6 @@ int gravity_incomplete_import_example(char *buf, int buflen);
 void gravity_clear_incomplete_import(void);
 void hydro_force(void);
 void init(void);
-GIZMO_GPU_FUNCTION void do_the_cooling_for_particle(int i, struct particle_data *pp, struct gas_cell_data *cell);
 double GetCoolingTime(double u_old, double rho, double ne_guess, double *ne_eval, int target, struct particle_data *pp, struct gas_cell_data *cell);
 double GetNetCoolingRate(double u_old, double rho, double ne_guess, double *ne_eval, int target, struct particle_data *pp, struct gas_cell_data *cell);
 GIZMO_GPU_FUNCTION double get_equilibrium_dust_temperature_estimate(int i, double shielding_factor_for_exgalbg, double T, struct particle_data *pp, struct gas_cell_data *cell);
@@ -1241,6 +1329,7 @@ const char *gizmo_controlled_stop_local_reason(void);
 int         gizmo_alloc_fits_this_rank(size_t bytes, int nblocks);   /* LOCAL (no MPI): 1 if `bytes` + `nblocks` fit in THIS rank's arena + block-table, else 0. Safe in subset/turn; building block for caller-side OOM preflight. */
 int         gizmo_alloc_fits_all_ranks(size_t bytes, int nblocks);   /* collective: 1 if `bytes` AND `nblocks` blocks fit in the arena + block-table on EVERY rank, else 0 (caller-side preflight for large symmetric allocations) */
 size_t      gizmo_mymalloc_rounded_size(size_t n);      /* arena bytes a request of n actually consumes (MIN_ALIGNMENT rounding); for accurate preflight totals */
+size_t      comm_chunk_bytes(void);                      /* CommChunkSize in bytes: a fraction of a megabyte counts, at least 1, capped so that no byte arithmetic on it overflows */
 double      comm_chunk_megabytes_default(void);         /* size to send particle data between tasks in, when the parameter file does not say */
 /* Vista never-hang fatal policy (fail-fast, cleanup-forbidden) -- core/gizmo_fatal.{h,cc}. */
 [[noreturn]] void gizmo_fatal_hard_exit_reviewed(int code, const char *reason,
@@ -1480,20 +1569,6 @@ void cbe_corridor_end(void);
 #endif
 #endif
 
-#if defined(AGS_FACE_CALCULATION_IS_ACTIVE)
-/* Result of inverting an AGS face moment matrix. cn_expansion is the signal
- * that drives neighbor-count expansion (a large sentinel when the raw matrix
- * is singular, because matrix_invert_ndims() reports CN=1 for a zero inverse);
- * cn_final + status are diagnostics (status: 0=clean, 1=regularized via
- * diagonal-loading, 2=could-not-condition / near-zero raw matrix, warned). */
-struct AgsNvtInversion { double cn_expansion; double cn_final; int status; };
-/* Invert the symmetric raw moment matrix (upper-triangle components
- * sym6 = {00,01,02,11,12,22}) accumulated at AGS kernel size h into the full
- * symmetric face operator Tinv_out (= inverse of the raw moment matrix). Uses
- * the hydro density-path preconditioning (diagonal-loading until well-
- * conditioned). Single source of truth for AGS/CBE face NV_T inversion. */
-AgsNvtInversion ags_invert_nvt_for_faces(const double sym6[6], double h, double Tinv_out[3][3]);
-#endif
 
 #ifdef DM_FUZZY
 void do_dm_fuzzy_initialization(void);

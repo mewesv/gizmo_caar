@@ -46,27 +46,31 @@ static inline void grain_promotion_init_cellp(int i)
     CellP[i].CompositionType = ct;
 
     double rho0   = All.Tillotson_EOS_params[ct][3];
-    double A_mod  = All.Tillotson_EOS_params[ct][4];
     double u_s    = All.Tillotson_EOS_params[ct][6];
 
     CellP[i].Density               = rho0;
 #ifdef HYDRO_EXPLICITLY_INTEGRATE_VOLUME
     CellP[i].Density_ExplicitInt   = rho0;
+    CellP[i].KernelDensityForVolumeRelaxation = 0; /* set by the next density pass */
 #endif
     CellP[i].InternalEnergy        = 0.01 * u_s;
     CellP[i].InternalEnergyPred    = 0.01 * u_s;
-    CellP[i].Pressure              = 0.0;
-    CellP[i].SoundSpeed            = (rho0 > 0.0) ? sqrt(A_mod / rho0) : 0.0;
     CellP[i].DtInternalEnergy      = 0.0;
+    CellP[i].HydroAccel            = {};  /* no hydro force yet: its first half-step kick comes before its first force evaluation */
 
     CellP[i].Elastic_Stress_Tensor      = {};
     CellP[i].Elastic_Stress_Tensor_Pred = {};
     CellP[i].Dt_Elastic_Stress_Tensor   = {};
+    CellP[i].RecentYieldMemory          = 0;
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+    CellP[i].SolidBesideGas             = 0; /* set by its first gradient pass */
+    CellP[i].SolidVelocityDivergence    = 0;
+#endif
 
 #ifdef EOS_DAMAGE_POROSITY
     CellP[i].Damage       = 0.0;
     CellP[i].ActiveCracks = 0.0;
-    CellP[i].Distention   = All.Tillotson_EOS_params[ct][15]; /* alpha_0 */
+    CellP[i].Distention   = solid_material_of(ct).InitialDistention; /* alpha_0 */
 #endif
 #ifdef MHD_MODIFIED_GRADIENT
     CellP[i].MG_cgcoeff = 0; CellP[i].MG_piece_token = 0; CellP[i].MG_envelope = 0;   /* a new gas cell has no MG state */

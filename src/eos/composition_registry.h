@@ -12,7 +12,9 @@
    simultaneously the dispatch in eos.cc selects exactly one branch
    (instead of running serial #ifdef blocks that would double-stomp). */
 
+#ifndef GIZMO_config_H
 #include "../GIZMO_config.h"
+#endif
 /* GIZMO_GPU_FUNCTION comes from here rather than from whatever an includer
    happened to pull in first. Every current include path reaches this header
    after macros.h, so nothing changes today, but a header whose bodies only
@@ -30,7 +32,7 @@ enum EosBranch {
     /* EOS_BRANCH_CHABRIER_HHE = 3, // 17d */
 };
 
-/* Tillotson sub-indices into All.Tillotson_EOS_params[N_TILLOTSON_MATERIALS][12].
+/* Tillotson sub-indices into All.Tillotson_EOS_params[N_TILLOTSON_MATERIALS][10] (and, for every elastic build, All.SolidMaterial[]).
    Indices 1..6 are the named presets (set by tillotson_eos_init() in
    solids/elastic_physics.cc). Slot 0 is a usable custom material whose
    parameters come from the parameterfile (Tillotson_EOS_params_*), loaded into
@@ -55,6 +57,36 @@ enum {
     MATERIAL_TILLOTSON_WATER   = 6
 };
 #define N_TILLOTSON_MATERIALS 7
+
+/* Constitutive (strength, damage, porosity) properties of a solid material, kept apart from
+   the EOS coefficients: an ANEOS table and a Tillotson row both name a material whose strength
+   comes from here. All.SolidMaterial[] holds one entry per CompositionType, resolved once at
+   startup (solid_material_resolve) from the named presets and the parameterfile, and every
+   consumer reads it through solid_material_of(). Code units, except where noted. */
+struct solid_material {
+    double ShearModulus;          /* mu */
+    double YieldStrength;         /* Y_0, von Mises */
+    double WeibullK;              /* Weibull flaw density coefficient k [1/code length^3] */
+    double WeibullM;              /* Weibull exponent m */
+    double DruckerPragerMu;       /* Drucker-Prager friction coefficient */
+    double InitialDistention;     /* alpha_0 of the P-alpha porosity model (1 = compact) */
+    double CrushPressureElastic;  /* P_e of the P-alpha model */
+    double CrushPressureSolid;    /* P_s of the P-alpha model */
+    double ReferenceDensity;      /* compact reference density rho_0 (Tillotson rho_0, or an ANEOS table's own value): an element's flaw volume is its mass x InitialDistention / rho_0 */
+    double FractureActivation;    /* fracture law: 0 = tensile flaws (Benz & Asphaug), 1 = the shear-activated law */
+};
+#define N_SOLID_MATERIAL_PROPERTIES 10  /* the doubles above, in order (written as one row per id to the snapshot header) */
+#define FRACTURE_ACTIVATION_TENSILE_FLAWS 0
+#define FRACTURE_ACTIVATION_SHEAR         1
+static_assert(sizeof(struct solid_material) == N_SOLID_MATERIAL_PROPERTIES * sizeof(double), "struct solid_material must stay N_SOLID_MATERIAL_PROPERTIES doubles");
+#define N_SOLID_MATERIAL_IDS 16   /* >= every CompositionType layout: Tillotson rows + ANEOS tables (+1 for the gas slot) */
+
+/* Is this composition an elastic solid? Under EOS_TYPES_DEFAULTGAS_AND_SOLIDS composition 0 is the
+   ordinary gas fluid, which carries no deviatoric stress; every other id is a solid. */
+GIZMO_GPU_FUNCTION static inline int solid_material_is_elastic(int composition_type)
+{
+    return (composition_type != MATERIAL_TILLOTSON_UNUSED);
+}
 
 /* CompositionType -> EosBranch resolver.
 

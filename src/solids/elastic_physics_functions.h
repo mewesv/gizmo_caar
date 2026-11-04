@@ -32,23 +32,44 @@
 
 
 #ifdef EOS_ELASTIC
-/* apply_drucker_prager / damage_update_grady_kipp, used by the stress update below
+/* apply_drucker_prager and the fracture-damage updates, used by the stress update below
    under the EOS_DAMAGE_POROSITY bits. Safe to include here: it carries an include
    guard and does not pull in Kokkos. */
 #include "damage_porosity_functions.h"
+
+/* time derivative of the deviatoric stress tensor from a velocity gradient (Hooke's law with the Jaumann rotation) */
+KOKKOS_INLINE_FUNCTION
+void elastic_stress_rate_P(int i, const double dv0[3][3], struct gas_cell_data *cell)
+{
+    int j,k,l,NDim=NUMDIMS;
+    double R[3][3], S[3][3], dS=0;
+    if(!solid_material_is_elastic(cell[i].CompositionType)) {return;} /* the gas of a gas+solid build carries no deviatoric stress */
+    double mu = solid_material_of(cell[i].CompositionType).ShearModulus;
+    for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {S[j][k] = cell[i].Elastic_Stress_Tensor_Pred[j][k];}}
+    for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {R[j][k] = 0.5*(dv0[j][k] - dv0[k][j]);}}
+    double trace_vel=0; for(j=0;j<NDim;j++) {trace_vel += dv0[j][j];}
+    for(j=0;j<NDim;j++) // velocity index
+    {
+        for(k=0;k<NDim;k++) // gradient index
+        {
+            dS = mu * (dv0[j][k] + dv0[k][j]); // symmetric strain component
+            if(k==j) {dS -= 2.*mu*trace_vel/NDim;} // trace component
+            for(l=0;l<NDim;l++) {dS += R[j][l]*S[l][k] - S[j][l]*R[l][k];} // Jaumann rotation W.S - S.W, with R = W = (dv_j/dx_k - dv_k/dx_j)/2: the stress turns with the material
+            cell[i].Dt_Elastic_Stress_Tensor[j][k] = dS; // save it to variable
+        }
+    }
+}
 
 /* routine to update the deviatoric stress tensor */
 KOKKOS_INLINE_FUNCTION
 void elastic_body_update_driftkick_P(int i, double dt_entr, int mode,
                                      struct particle_data *pp, struct gas_cell_data *cell)
 {
-    int j,k,l,NDim=NUMDIMS;
-    double dv0[3][3], R[3][3], S[3][3], S_new[3][3], dS=0, mu, Y0, J2=0, I1=0;
-#ifdef EOS_TILLOTSON
-    mu = All.Tillotson_EOS_params[cell[i].CompositionType][10]; Y0 = All.Tillotson_EOS_params[cell[i].CompositionType][11]; // set for composition
-#else
-    mu = All.Tillotson_EOS_params[0][10]; Y0 = All.Tillotson_EOS_params[0][11];  // set to universal constants
-#endif
+    int j,k,NDim=NUMDIMS;
+    double dv0[3][3], S_new[3][3], mu, Y0, J2=0, I1=0;
+    if(!solid_material_is_elastic(cell[i].CompositionType)) {return;} /* the gas of a gas+solid build carries no deviatoric stress */
+    const struct solid_material &material = solid_material_of(cell[i].CompositionType);
+    mu = material.ShearModulus; Y0 = material.YieldStrength;
 
     if(mode < 2) // drift or kick operation
     {
@@ -66,20 +87,71 @@ void elastic_body_update_driftkick_P(int i, double dt_entr, int mode,
 #if defined(EOS_DAMAGE_POROSITY) && DAMAGE_POROSITY_BIT_DRUCKER_PRAGER
         Y_eff = apply_drucker_prager(Y0, cell[i].Pressure, cell[i].CompositionType);
 #endif
+        volatile int yield_return_applied = 0;
         if(J2 > 0)
         {
-            double f_Y = Y_eff*Y_eff/(NDim*J2);
-            if(f_Y < 1) {for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {S_new[j][k] *= f_Y;}}}
+            double f_Y = Y_eff*Y_eff/(NDim*J2); // (yield stress / equivalent stress)^2
+            if(f_Y < 1) {double return_factor = sqrt(f_Y); for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {S_new[j][k] *= return_factor;}} yield_return_applied = 1;} // radial return: scale the deviator back onto the yield surface (Wilkins 1964)
         }
-#if defined(EOS_DAMAGE_POROSITY) && DAMAGE_POROSITY_BIT_GRADY_KIPP
-        /* bit 0: Grady-Kipp damage update at kick (mode==0) only */
+        /* recent-yield memory, at the kick only: decay it over RECENT_YIELD_MEMORY_SOUND_CROSSINGS sound-crossing times of the
+           (physical) kernel radius, then add the overstress the return just removed, in units of the material's yield strength
+           (for von Mises plasticity, summed over kicks, this is proportional to the plastic strain in yield strains, so the update
+           converges with the timestep); the hydro pair uses it to switch the tensile-instability correction off in material that
+           is flowing plastically. */
+        if(mode == 0)
+        {
+            double h_phys = pp[i].KernelRadius * All.cf_atime, c_s = cell[i].SoundSpeed;
+            if(h_phys > 0 && c_s > 0 && dt_entr > 0) {cell[i].RecentYieldMemory *= exp(-dt_entr * c_s / (RECENT_YIELD_MEMORY_SOUND_CROSSINGS * h_phys));}
+            if(yield_return_applied)
+            {
+                double Y_norm = (Y0 > 0) ? Y0 : Y_eff; /* a cohesionless (Drucker-Prager) material: its current pressure-dependent strength */
+                if(Y_norm > 0) {
+                    double overstress = (sqrt(NDim*J2) - Y_eff) / Y_norm;
+                    if(isfinite(overstress) && overstress > 0) {cell[i].RecentYieldMemory += overstress;}
+                } else {cell[i].RecentYieldMemory = DMAX(cell[i].RecentYieldMemory, 2.*TENSILE_CORRECTION_YIELD_MEMORY_ONSET);} /* no strength at all: the correction is fully off */
+            }
+        }
+#if defined(EOS_DAMAGE_POROSITY) && DAMAGE_POROSITY_BIT_FRACTURE
+        /* bit 0: fracture damage, updated at the kick (mode==0) only, by the law the material names */
         if(mode == 0)
         {
             double D_new, A_new;
-            damage_update_grady_kipp(cell[i].Damage, cell[i].ActiveCracks,
-                                     J2, mu, cell[i].SoundSpeed, dt_entr,
-                                     cell[i].CompositionType,
-                                     &D_new, &A_new);
+            int composition = cell[i].CompositionType;
+            volatile int shear_activated = (solid_material_of(composition).FractureActivation == FRACTURE_ACTIVATION_SHEAR);
+            if(shear_activated)
+            {
+                damage_update_grady_kipp(cell[i].Damage, cell[i].ActiveCracks,
+                                         J2, mu, cell[i].SoundSpeed, dt_entr,
+                                         composition,
+                                         &D_new, &A_new);
+            } else {
+                /* the damage-reduced total stress the flaws see: -P I + (1-D) S (the EOS pressure already carries (1-D) of any tension) */
+                double D_now = cell[i].Damage, stress[3][3] = {{0}};
+                for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {stress[j][k] = (1. - D_now) * S_new[j][k];} stress[j][j] -= cell[i].Pressure;}
+                double rho_i = cell[i].Density;
+                /* the material bulk modulus: Tillotson's A; a tabulated material has no constant, so its local rho c_bulk^2 */
+                double bulk_modulus = rho_i * (cell[i].SoundSpeed*cell[i].SoundSpeed - elastic_longitudinal_soundspeed2_excess(composition, rho_i));
+#ifdef EOS_TILLOTSON
+                if(eos_branch_of(composition) == EOS_BRANCH_TILLOTSON) {bulk_modulus = All.Tillotson_EOS_params[tillotson_subindex(composition)][4];}
+#endif
+                /* the fixed volume holding the element's flaws (its compact reference volume; times the out-of-plane extent in 1D/2D) and its flaw-count bound */
+                double flaw_volume = pp[i].Mass / solid_material_of(composition).ReferenceDensity;
+#if ((EOS_DAMAGE_POROSITY) & 4)
+                flaw_volume *= solid_material_of(composition).InitialDistention; /* a porous element's bulk reference volume */
+#endif
+#if (NUMDIMS < 3)
+                flaw_volume *= All.FractureOutOfPlaneExtent;
+#endif
+                double s_max = All.SolidMaterialFlawsPerMass[composition] * pp[i].Mass;
+                uint64_t identity = gizmo_rng_particle_identity((uint64_t)pp[i].ID, (uint64_t)pp[i].ID_child_number, (uint64_t)pp[i].ID_generation); /* persistent: split children differ */
+                if(damage_update_tensile_flaws(D_now, cell[i].ActiveCracks, stress, NDim, bulk_modulus, mu, rho_i, pp[i].Mass / rho_i,
+                                               flaw_volume, s_max, identity, dt_entr, composition, &D_new, &A_new))
+                {
+                    printf("ERROR: tensile flaws: element ID %llu (child %llu) has more than %d flaws (s_max %g; its mass grew past the startup bound)\n",
+                           (unsigned long long)pp[i].ID, (unsigned long long)pp[i].ID_child_number, 10 * TENSILE_FLAWS_MAX_PER_ELEMENT, s_max);
+                    endrun(1154);
+                }
+            }
             cell[i].Damage       = (MyFloat)D_new;
             cell[i].ActiveCracks = (MyFloat)A_new;
         }
@@ -94,19 +166,7 @@ void elastic_body_update_driftkick_P(int i, double dt_entr, int mode,
 
         // ok all below is for mode = 2, which is the actual calculation of the time derivative of the stress tensor
         for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {dv0[j][k] = cell[i].Gradients.Velocity[j][k];}}
-        for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {S[j][k] = cell[i].Elastic_Stress_Tensor_Pred[j][k];}}
-        for(j=0;j<NDim;j++) {for(k=0;k<NDim;k++) {R[j][k] = 0.5*(dv0[j][k] - dv0[k][j]);}}
-        double trace_vel=0; for(j=0;j<NDim;j++) {trace_vel += dv0[j][j];}
-        for(j=0;j<NDim;j++) // velocity index
-        {
-            for(k=0;k<NDim;k++) // gradient index
-            {
-                dS = mu * (dv0[j][k] + dv0[k][j]); // symmetric strain component
-                if(k==j) {dS -= 2.*mu*trace_vel/NDim;} // trace component
-                for(l=0;l<NDim;l++) {dS += S[j][l]*R[l][k] - R[j][l]*S[l][k];} // rotation components
-                cell[i].Dt_Elastic_Stress_Tensor[j][k] = dS; // save it to variable
-            }
-        }
+        elastic_stress_rate_P(i, dv0, cell);
 
     }
 

@@ -638,8 +638,7 @@ integertime get_timestep(int p,		/*!< particle index */
     {
         /* a grain has no cell of its own, so the surrounding gas temperature and ionized fraction are carried onto
            it and the composition estimated from them */
-        csnd = GAMMA_DEFAULT * P[p].Gas_Temperature
-               / (molecular_weight_estimator_for_gas_around_grain(P[p].Gas_Temperature, P[p].Gas_fion) * U_TO_TEMP_UNITS);
+        csnd = gas_soundspeed2_around_grain(P[p].Gas_Temperature, P[p].Gas_fion);
         csnd += (P[p].Gas_Velocity - P[p].Vel).norm_sq();
 #if defined(DO_FLUID_DRAG_CALCULATION_WITHBFIELDS)
         csnd += P[p].Gas_B.norm_sq() / (2.0 * P[p].Gas_Density + MIN_REAL_NUMBER);
@@ -680,7 +679,14 @@ integertime get_timestep(int p,		/*!< particle index */
         {
             csnd = 0.5 * CellP[p].MaxSignalVel ;
             double L_particle = P[p].Get_Particle_Size();
-            dt_courant = All.CourantFac * (L_particle*All.cf_atime) / csnd;
+            double courant_fac = All.CourantFac;
+#ifdef EOS_ELASTIC
+#ifdef EOS_TYPES_DEFAULTGAS_AND_SOLIDS
+            if(solid_material_is_elastic(CellP[p].CompositionType) || CellP[p].ElasticImpedanceNeighbour) /* in a gas+solid build, only solids and the gas next to them carry the dissipation */
+#endif
+            courant_fac = DMIN(courant_fac, ELASTIC_IMPEDANCE_COURANT_MAX); /* the solids' explicit face impedance dissipation is unstable above ~0.27 (constants.h) */
+#endif
+            dt_courant = courant_fac * (L_particle*All.cf_atime) / csnd;
 #if defined(SINK_WIND_SPAWN) && !defined(SINK_RIAF_SUBEDDINGTON_MODEL)
             if(P[p].ID == All.SpawnedWindCellID) {dt_courant *= 0.5;} // be more careful if this is a spawned-in gas cell
 #endif
@@ -761,7 +767,19 @@ integertime get_timestep(int p,		/*!< particle index */
                 L_cond = DMIN( L_particle , DMAX(1./L_cond_inv, 0.5*L_particle) ) * All.cf_atime; // more conservative estimator - may be needed sometimes to deal accurately with steep local gradients //
                 double diff_coeff = fabs(CellP[p].Eta_MHD_OhmicResistivity_Coeff) + fabs(CellP[p].Eta_MHD_HallEffect_Coeff) + fabs(CellP[p].Eta_MHD_AmbiPolarDiffusion_Coeff);
                 double dt_conduction = dt_prefac_diffusion * L_cond*L_cond / (MIN_REAL_NUMBER + diff_coeff);
-#ifdef SUPER_TIMESTEP_DIFFUSION
+#if defined(MHD_NON_IDEAL_EVOLVED_FLUX)
+                if(diff_coeff > 0)
+                {   /* the evolved non-ideal field propagates at the reduced speed of light: a Courant condition. The larger diffusive
+                       step above is taken instead only where the field relaxes to the standard non-ideal value within that step: the
+                       slowest (transverse) relaxation exponent over it, c~^2 dt (eta_O+eta_A)/eta_NI^2, must be large (residual < e^-10).
+                       There the evolved solver reproduces the standard one; elsewhere the explicit coupling needs the Courant step. */
+                    double dt_nonideal = All.CourantFac * (L_particle*All.cf_atime) / MHD_NON_IDEAL_REDUCED_C_CODE;
+                    double eta_OA = fabs(CellP[p].Eta_MHD_OhmicResistivity_Coeff) + fabs(CellP[p].Eta_MHD_AmbiPolarDiffusion_Coeff), eta_H = CellP[p].Eta_MHD_HallEffect_Coeff;
+                    double relax_exponent = MHD_NON_IDEAL_REDUCED_C_CODE * MHD_NON_IDEAL_REDUCED_C_CODE * dt_conduction * eta_OA / (MIN_REAL_NUMBER + eta_OA*eta_OA + eta_H*eta_H);
+                    if((dt_conduction > dt_nonideal) && (relax_exponent >= 10.)) {dt_nonideal = dt_conduction;}
+                    if(dt_nonideal < dt) {dt = dt_nonideal;}
+                }
+#elif defined(SUPER_TIMESTEP_DIFFUSION)
                 if(dt_conduction < dt_superstep_explicit) dt_superstep_explicit = dt_conduction; // explicit time-step
                 double dt_advective = dt_conduction * DMAX(1,DMAX(L_particle , 1/(MIN_REAL_NUMBER + L_cond_inv))*All.cf_atime / L_cond);
                 if(dt_advective < dt) dt = dt_advective; // 'advective' timestep: needed to limit super-stepping
@@ -1182,6 +1200,7 @@ integertime get_timestep(int p,		/*!< particle index */
         if(dt_accr > 0 && dt_accr < dt) {dt = dt_accr;}
 
         double dt_ngbs = 4.1 * get_physical_timestep_from_timebin(P[p].Sink_TimeBinGasNeighbor, p, P); /* standard wakeup-type threshold: use this by default here, unless dynamical interaction important (e.g. back-rx term from oscillation of sink c-o-m, which is important for single-sink sims */
+        if(dt_ngbs > 0) {dt_ngbs = DMAX(dt_ngbs, All.MinSizeTimestep);} /* neighbours on steps below the floor only exist while a snapshot restart ramps everything up from its smallest step (IO_GRADUAL_SNAPSHOT_RESTART); that ramp, not this limiter, holds the sink's step down then */
         if(dt > dt_ngbs && dt_ngbs > 0) {dt = 1.01 * dt_ngbs; }
 
 #if defined(SINGLE_STAR_TIMESTEPPING)
@@ -1619,9 +1638,16 @@ void process_wake_ups(void)
 	    if(bin != binold)
 	    {
 		integertime tstart = P[i].Ti_begstep + P[i].integertime_step(); /* the step this particle is actually on, which a previous demotion may have truncated below its bin length */
+#ifdef TURB_DRIVING
+		const integertime ti_previous_step_start = P[i].Ti_begstep;
+#endif
 		integertime t_2 = P[i].Ti_current;
 		if(t_2 > tstart) {tstart = t_2;}
 		integertime tend = All.Ti_Current;
+#ifndef HYDRO_MESHLESS_FINITE_VOLUME
+		const integertime old_midpoint = P[i].Ti_begstep + P[i].integertime_step() / 2;
+		const int new_step_starts_now = (P[i].Ti_current == All.Ti_Current) && TimeBinActive[bin] && (P[i].integertime_step() == GET_INTEGERTIME_FROM_TIMEBIN(binold)); /* a particle not drifted to now keeps the truncated step below, a bin not active now cannot be kicked, and a step an earlier wake-up truncated without a kick has no midpoint to continue from */
+#endif
 
 		TimeBinCount[binold]--;
 		if(P[i].Type == 0) {TimeBinCountGas[binold]--;}
@@ -1653,12 +1679,19 @@ void process_wake_ups(void)
 		n++;
 		WokenParticles.push_back(i);
 
-		/* The kick this particle already received covers past the time it is being woken to. Do NOT
-		   try to reverse it: re-deriving the increment with reversed bounds would only cancel the
-		   original if the acceleration and energy rate were unchanged since, and they are not, so it
-		   injects energy instead. Saitoh & Makino (2009) eq (3) avoids integrating the system backwards
-		   for exactly this reason and instead sets the new time consistent with the system time, which
-		   is what the truncation below does. */
+#ifndef HYDRO_MESHLESS_FINITE_VOLUME
+		/* The old step kicked this particle only to its midpoint, so that is where its velocity and
+		   energy stand, whether the wake-up falls before or after it. The new step starts now, and its
+		   first half-kick is only run for particles that were already active when this step began, so
+		   this one never gets it. Complete the old step here, carrying the particle from its midpoint
+		   to now with the acceleration and energy rate that step used (a particle that is not active
+		   only has them from its own last solve), and give it the first half-kick of the new step
+		   below. Only the interval the old step really applied is undone, not the second half it
+		   never reached. (Finite-volume gas runs its first kick by time bin, so it gets the first
+		   half-kick but not this completion of the old step. A particle in the cases excluded above
+		   keeps the truncated step below and no kick.) */
+		if(new_step_starts_now) {do_the_kick(i, old_midpoint, All.Ti_Current, P[i].Ti_current, 1);}
+#endif
 		if(tend < tstart) {set_predicted_quantities_for_extra_physics(i);}
 		/* End the step at the current system time, so the interval the applied kick already covered is
 		   not integrated twice. dt_step stays authoritative, but is no longer a power-of-two bin length
@@ -1671,12 +1704,18 @@ void process_wake_ups(void)
 		}
 #if defined(USE_TIMESTEP_DILATION_FOR_ZOOMS)
         /* a wakeup starts a new step for this particle, so freeze its dilation factor at the
-           position it now holds, as a normal timestep assignment would. This must follow the
-           partial kick reversed just above, which cancels the kick it undoes only while the
-           factor still matches the one that kick was applied with. */
+           position it now holds, as a normal timestep assignment would. Where the old step was
+           completed above, that kick covered time under the old step's factor and so had to come
+           first; the interval of the new step is converted with the factor frozen here. */
         P[i].TimestepDilationFactor = return_timestep_dilation_factor(i, P);
 #endif
 		if(P[i].Ti_current < All.Ti_Current) {P[i].Ti_current=All.Ti_Current;}
+#ifdef TURB_DRIVING
+		turb_accel_refresh_for_new_step(i, ti_previous_step_start);
+#endif
+#ifndef HYDRO_MESHLESS_FINITE_VOLUME
+		if(new_step_starts_now) {do_the_kick(i, P[i].Ti_begstep, P[i].Ti_begstep + P[i].integertime_step() / 2, P[i].Ti_current, 0);} /* the first half-kick of the new step, as do_first_halfstep_kick gives an active particle */
+#endif
 	    }
 	}
     }

@@ -39,7 +39,9 @@
 #include <omp.h>
 #endif
 
+#ifndef GIZMO_config_H /* the header defines it; a standalone build (e.g. a unit test) may define it to compile without a Config */
 #include "../GIZMO_config.h"
+#endif
 
 #include "precompiler_logic.h"
 
@@ -237,7 +239,6 @@ extern double Max_Unspawned_MassUnits_fromSink;
 
 extern long long Ntype[6];	/*!< total number of particles of each type */
 extern int NtypeLocal[6];	/*!< local number of particles of each type */
-extern gizmo_rng_t random_generator;	/*!< the random number generator used */
 extern int Gas_split;           /*!< current number of newly-spawned gas particles outside block */
 #ifdef GALSF
 extern int Stars_converted;	/*!< current number of star particles in gas particle block */
@@ -294,6 +295,7 @@ extern double* StAkb; // phases (imag part)
 extern double* StMode; // k vectors
 extern int StNModes; // total number of modes
 extern integertime StTPrev; // time of last update (to determine when next will be)
+extern integertime StTUpdatedAt; // time at which the driving phases last changed
 extern gizmo_rng_t StRng; // random number generator key
 #endif
 
@@ -443,6 +445,18 @@ extern struct global_data_all_processes All;
  * physics needing rho_DM / sigma_DM at gas cells: add to this OR. */
 #if (defined(GALSF_SUBGRID_WINDS) && (GALSF_SUBGRID_WIND_SCALING==2)) || defined(DM_HEATING)
 #define DM_DISPERSION_LOOP_ACTIVE
+#endif
+
+#ifdef EOS_ELASTIC
+/* the strength/damage/porosity properties of a cell's material (resolved at startup; see eos/composition_registry.h) */
+GIZMO_GPU_FUNCTION static inline const struct solid_material& solid_material_of(int composition_type) {return All.SolidMaterial[composition_type];}
+/* deviatoric stiffness added to the bulk modulus for uniaxial (longitudinal) strain under the stress law
+   dS/dt = 2 mu (strain rate - trace/NUMDIMS): c_L^2 = c_bulk^2 + 2 (1 - 1/NUMDIMS) mu / rho  (4/3 mu in 3D, mu in 2D) */
+GIZMO_GPU_FUNCTION static inline double elastic_longitudinal_soundspeed2_excess(int composition_type, double rho)
+{
+    if(!solid_material_is_elastic(composition_type) || !(rho > 0)) {return 0;}
+    return (2.0 * (1.0 - 1.0/NUMDIMS)) * solid_material_of(composition_type).ShearModulus / rho;
+}
 #endif
 
 #include "particle_data.h"
@@ -643,6 +657,7 @@ enum iofields
   IO_AMBIPOLAR,
   IO_OHMIC,
   IO_HALL,
+  IO_NONIDEAL_FLUX,
   IO_IMF,
   IO_COSMICRAY_ENERGY,
   IO_COSMICRAY_KAPPA,
@@ -670,6 +685,7 @@ enum iofields
   IO_PRESSURE,
   IO_EOSCS,
   IO_EOS_STRESS_TENSOR,
+  IO_EOS_RECENT_YIELD_MEMORY,
   IO_CBE_MOMENTS,
   IO_EOSCOMP,
   IO_EOSPHASE,

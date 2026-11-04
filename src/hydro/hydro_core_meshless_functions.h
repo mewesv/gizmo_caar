@@ -61,6 +61,7 @@ void hydro_core_meshless_compute_pair(
     double &face_vel_j,
     double &face_area_dot_vel,
     double &mdot_estimated,
+    Vec3<double> &face_velocity_jump,
     struct Input_vec_Riemann &Riemann_vec,
     struct Riemann_outputs &Riemann_out,
     struct Conserved_var_Riemann &Fluxes,
@@ -83,6 +84,17 @@ void hydro_core_meshless_compute_pair(
     if((Pressure_i < 0) || (Pressure_j < 0)) {
         dummy_pressure = -DMIN(Pressure_i, Pressure_j);
         Pressure_i += dummy_pressure; Pressure_j += dummy_pressure;
+#ifdef EOS_ELASTIC
+        /* the correction guards elastic tension against pairing; in material that has recently flowed plastically it is not
+           needed and its repulsion feeds a tensile runaway, so it switches off smoothly as the pair's larger recent-yield memory
+           rises from TENSILE_CORRECTION_YIELD_MEMORY_ONSET to twice that */
+        double yield_memory = DMAX(local.RecentYieldMemory, CellP[j].RecentYieldMemory);
+        if(yield_memory > TENSILE_CORRECTION_YIELD_MEMORY_ONSET)
+        {
+            double s = DMIN(1., (yield_memory - TENSILE_CORRECTION_YIELD_MEMORY_ONSET) / TENSILE_CORRECTION_YIELD_MEMORY_ONSET);
+            tensile_correction_factor *= 1. - s * s * (3. - 2. * s);
+        }
+#endif
         dummy_pressure *= 1. - tensile_correction_factor;
     }
 #endif
@@ -159,22 +171,34 @@ void hydro_core_meshless_compute_pair(
     rho_j *= Vj_inv_corr; P_j *= Vj_inv_corr;
 #endif
 
+    int scalar_recon_mode = recon_mode;
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS) && defined(HYDRO_MESHLESS_FINITE_MASS)
+    /* a face between the gas and a solid that carries shear: neither side's gradients extrapolate meaningfully into the other
+       material, so the Riemann problem takes the cell-centred hydrodynamic states (magnetic fields are still reconstructed); the
+       velocity is still reconstructed first, for the jump the elastic impedance dissipation acts on */
+    int solid_i = solid_material_is_elastic(local.CompositionType), solid_j = solid_material_is_elastic(CellP[j].CompositionType);
+    volatile int gas_solid_interface = (solid_i != solid_j) && (solid_material_of(solid_i ? local.CompositionType : CellP[j].CompositionType).ShearModulus > 0); /* volatile: a runtime gate in device code */
+    if(gas_solid_interface) {scalar_recon_mode = 0;}
+#endif
     reconstruct_face_states(rho_i, local.Gradients.Density, rho_j, CellP[j].Gradients.Density,
-                            distance_from_i, distance_from_j, &Riemann_vec.L.rho, &Riemann_vec.R.rho, recon_mode);
+                            distance_from_i, distance_from_j, &Riemann_vec.L.rho, &Riemann_vec.R.rho, scalar_recon_mode);
     reconstruct_face_states(P_i, local.Gradients.Pressure, P_j, CellP[j].Gradients.Pressure,
-                            distance_from_i, distance_from_j, &Riemann_vec.L.p, &Riemann_vec.R.p, recon_mode);
+                            distance_from_i, distance_from_j, &Riemann_vec.L.p, &Riemann_vec.R.p, scalar_recon_mode);
 #ifdef EOS_GENERAL
     reconstruct_face_states(local.InternalEnergyPred, local.Gradients.InternalEnergy,
                             CellP[j].InternalEnergyPred, CellP[j].Gradients.InternalEnergy,
-                            distance_from_i, distance_from_j, &Riemann_vec.L.u, &Riemann_vec.R.u, recon_mode);
+                            distance_from_i, distance_from_j, &Riemann_vec.L.u, &Riemann_vec.R.u, scalar_recon_mode);
     reconstruct_face_states(kernel.sound_i, local.Gradients.SoundSpeed, kernel.sound_j, CellP[j].Gradients.SoundSpeed,
-                            distance_from_i, distance_from_j, &Riemann_vec.L.cs, &Riemann_vec.R.cs, recon_mode);
+                            distance_from_i, distance_from_j, &Riemann_vec.L.cs, &Riemann_vec.R.cs, scalar_recon_mode);
 #endif
-    for(k=0; k<3; k++) {
-        reconstruct_face_states(local.Vel[k], local.Gradients.Velocity[k], VelPred_j[k], CellP[j].Gradients.Velocity[k],
+    for(k=0; k<3; k++) { /* reconstruct the velocity relative to the face: the limiter keeps a value's sign, and a velocity's sign depends on the frame */
+        reconstruct_face_states(local.Vel[k] - v_frame[k], local.Gradients.Velocity[k], VelPred_j[k] - v_frame[k], CellP[j].Gradients.Velocity[k],
                                 distance_from_i, distance_from_j, &Riemann_vec.L.v[k], &Riemann_vec.R.v[k], recon_mode);
-        Riemann_vec.L.v[k] -= v_frame[k]; Riemann_vec.R.v[k] -= v_frame[k];
     }
+    face_velocity_jump = Riemann_vec.R.v - Riemann_vec.L.v; /* the reconstructed jump (i minus j), before any fallback below resets the states */
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS) && defined(HYDRO_MESHLESS_FINITE_MASS)
+    if(gas_solid_interface) {Riemann_vec.R.v = local.Vel - v_frame; Riemann_vec.L.v = VelPred_j - v_frame;} /* cell-centred, like the scalars above */
+#endif
 #ifdef MAGNETIC
     int slim_mode = 1;
 #ifdef MHD_CONSTRAINED_GRADIENT
@@ -376,7 +400,7 @@ void hydro_core_meshless_compute_pair(
             if(Fluxes.rho < 0) {
                 Fluxes.CosmicRayAlfvenEnergy[k][kAlf] += local.CosmicRayAlfvenEnergy[k][kAlf] * Fluxes.rho / local.Mass;
             } else {
-                Fluxes.CosmicRayAlfvenEnergy[k][kAlf] += CellP[j].CosmicRayAlfvenEnergy[k][kAlf] * Fluxes.rho / local.Mass;
+                Fluxes.CosmicRayAlfvenEnergy[k][kAlf] += CellP[j].CosmicRayAlfvenEnergyPred[k][kAlf] * Fluxes.rho / P[j].Mass;
             }
         }
 #endif
@@ -391,13 +415,16 @@ void hydro_core_meshless_compute_pair(
 #endif
 #endif
 
-#if defined(HYDRO_MESHLESS_FINITE_MASS) && (SLOPE_LIMITER_TOLERANCE < 2) && !(defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS))
+/* the face entropic switch: on slow faces, replace the Riemann energy flux by the PdV form, unless that would move energy
+   against the thermal ordering of the two sides. It edits only the isotropic (P_M) energy flux, so with EOS_ELASTIC the
+   deviatoric-stress force and its work (added afterwards) are untouched. Tillotson builds keep the Riemann flux everywhere. */
+#if defined(HYDRO_MESHLESS_FINITE_MASS) && (SLOPE_LIMITER_TOLERANCE < 2) && (!(defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS)) || (defined(EOS_ANEOS) && !defined(EOS_TILLOTSON)))
     {
         double SM_over_ceff = fabs(Riemann_out.S_M) / DMIN(kernel.sound_i, kernel.sound_j);
         if((SM_over_ceff < epsilon_entropic_eos_big && All.ComovingIntegrationOn >= 0) || (leak_vs_tol > 1))
         {
 #ifdef MAGNETIC
-            Riemann_out.P_M -= 0.5 * Riemann_out.Face_B.norm_sq();
+            Riemann_out.P_M -= Riemann_out.Face_MagneticPressure;
 #endif
             volatile int use_entropic_energy_equation = 1; /* volatile: nvc++ may otherwise fold this runtime gate to its initializer inside device code */
             double facenorm_pm = Riemann_out.P_M * Face_Area_Norm;
@@ -408,14 +435,22 @@ void hydro_core_meshless_compute_pair(
             double du_new = 0.5 * (PdV_i - PdV_j + facenorm_pm * (face_vel_i + face_vel_j));
             double cnum2 = CellP[j].ConditionNumber * CellP[j].ConditionNumber;
             double epsilon_threshold_entropic_eos_ratio = 1.001;
-            if(SM_over_ceff > epsilon_entropic_eos_small && cnum2 < cnumcrit2)
+#ifdef EOS_ANEOS
+            /* order the two sides by temperature: for a tabulated condensed-matter EOS, P/rho does not order the thermal state
+               (a cold compressed cell can have the larger P/rho); without a valid temperature on both sides, keep the Riemann flux */
+            double thermal_order_i = local.Temperature, thermal_order_j = CellP[j].Temperature;
+            if(!(thermal_order_i > 0 && thermal_order_j > 0 && isfinite(thermal_order_i) && isfinite(thermal_order_j))) {use_entropic_energy_equation = 0;}
+#else
+            double thermal_order_i = Pressure_i / local.Density, thermal_order_j = Pressure_j / CellP[j].Density;
+#endif
+            if(use_entropic_energy_equation && SM_over_ceff > epsilon_entropic_eos_small && cnum2 < cnumcrit2)
             {
-                if(Pressure_i / local.Density > epsilon_threshold_entropic_eos_ratio * Pressure_j / CellP[j].Density)
+                if(thermal_order_i > epsilon_threshold_entropic_eos_ratio * thermal_order_j)
                 {
                     double dtoj = -du_old + facenorm_pm * face_vel_j;
                     if(dtoj > 0) { use_entropic_energy_equation = 0; }
                     else { if(dtoj < 0) { if(dtoj > -du_new + facenorm_pm * face_vel_j) { use_entropic_energy_equation = 0; } } }
-                } else if(epsilon_threshold_entropic_eos_ratio * Pressure_i / local.Density < Pressure_j / CellP[j].Density) {
+                } else if(epsilon_threshold_entropic_eos_ratio * thermal_order_i < thermal_order_j) {
                     double dtoi = +du_old - facenorm_pm * face_vel_i;
                     if(dtoi > 0) { use_entropic_energy_equation = 0; }
                     else { if(dtoi < 0) { if(dtoi > +du_new - facenorm_pm * face_vel_i) { use_entropic_energy_equation = 0; } } }

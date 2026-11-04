@@ -14,6 +14,7 @@
 #include "../declarations/allvars.h"
 #include "../declarations/multifluid_helpers.h"
 #include "../core/proto.h"
+#include "../declarations/gpu_rng.h"
 #include "ghost_writeback.h"   /* ghost_get_num_local/num_ghosts */
 #include "../core/wakeup_sidecar.h"
 #include "../mesh/kernel.h"
@@ -27,7 +28,12 @@
 #include "../system/gpu_particles_arena.h"
 
 #include <vector>
+#include <set>
+#include <array>
 #include "../mesh/gpu_neighbor_list.h"
+#include "../core/predict_functions.h" /* box_wrap_position_to_primary_image */
+
+static Vec3<double> merged_position(int i, int j);
 #include "../mesh/ghost_writeback.h"
 #include "../gravity/gpu_pseudo_update.h" /* gpu_set_soa_nextnode / gpu_set_soa_sibling: keep SoA node thread coherent with the rearrange pointer fixups */
 #include "../gravity/forcetree.h"         /* force_tree_swap_attachment_slots: the standing tree's attachment record */
@@ -305,7 +311,8 @@ void merge_and_split_particles(void)
     } *Ptmp;
 
     int target_for_merger,dummy=0,numngb_inbox,startnode,i,j,n; double threshold_val;
-    int n_particles_merged,n_particles_split,n_particles_gas_split,MPI_n_particles_merged,MPI_n_particles_split,MPI_n_particles_gas_split;
+    int n_particles_merged,n_particles_split,n_particles_gas_split;
+    long long MPI_n_particles_merged,MPI_n_particles_split,MPI_n_particles_gas_split;   /* summed over ranks */
     (void)dummy; (void)numngb_inbox; (void)startnode; (void)n; /* may go unused on modern path */
     Gas_split=0; n_particles_merged=0; n_particles_split=0; n_particles_gas_split=0; MPI_n_particles_merged=0; MPI_n_particles_split=0; MPI_n_particles_gas_split=0;
     Ptmp = (struct flags_merg_split *) mymalloc("Ptmp", NumPart * sizeof(struct flags_merg_split));
@@ -392,15 +399,6 @@ void merge_and_split_particles(void)
 #else
         const int tid = 0;
 #endif
-        /* The criteria below may draw from the rank's random stream, which only one
-         * thread at a time may advance. Which thread draws which number carries no
-         * meaning here, so each thread works from a stream of its own, held privately
-         * so that neighbouring threads do not share the cache line it lives on. The
-         * seed fixes the draws for a given rank, step and thread count. */
-        gizmo_rng_t ms_rng;
-        gizmo_rng_init(&ms_rng, ((uint64_t)All.NumCurrentTiStep * 1000003ULL
-                                 + (uint64_t)ThisTask * 10007ULL
-                                 + (uint64_t)tid) ^ 0x6d5391a7ULL);
         std::vector<int> ms_idx_priv;
         std::vector<double> ms_rad_priv;
         std::vector<unsigned char> ms_kind_priv;
@@ -417,26 +415,16 @@ void merge_and_split_particles(void)
                                                       * either way, and cheap, so testing it
                                                       * before the far more expensive criteria
                                                       * cannot by itself admit or reject
-                                                      * anything -- it only avoids asking. Note
-                                                      * those criteria may draw from a random
-                                                      * stream, so asking fewer of them
-                                                      * does change which elements draw and
-                                                      * therefore the realised candidate set.
-                                                      * That is accepted here: the visit order
-                                                      * is already arbitrary and only the
-                                                      * statistics of this routine are meant to
-                                                      * be reproducible. */
+                                                      * anything -- it only avoids asking. */
 #ifndef PREVENT_PARTICLE_MERGE_SPLIT
             /* The gates both criteria share, applied once. They used to sit inside each
              * criterion, so an element that was not a merger went on to be asked a second
-             * time as a possible split -- and where a minimum time between refinements is
-             * enforced, that second question draws a fresh randomised wait. Today the two
-             * criteria are mutually exclusive and only one answer is ever acted on, so
-             * the extra draw is discarded rather than compounding; asking once here keeps
-             * that true without depending on it. */
+             * time as a possible split. Today the two criteria are mutually exclusive and
+             * only one answer is ever acted on; asking once here keeps that true without
+             * depending on it. */
             if (P[ip].Type == 0 && CellP[ip].recent_refinement_flag == 1) continue;
 #if defined(FIRE_SUPERLAGRANGIAN_JEANS_REFINEMENT) || defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
-            if (check_if_sufficient_mergesplit_time_has_passed(ip, &ms_rng) == 0) continue;
+            if (check_if_sufficient_mergesplit_time_has_passed(ip) == 0) continue;
 #endif
 #endif
             const int want_merge = does_particle_need_to_be_merged(ip);
@@ -487,6 +475,12 @@ void merge_and_split_particles(void)
         }
         const int *gnl_neighbors = gnl_neighbors_host.empty() ? NULL : gnl_neighbors_host.data();
 
+        /* merged positions claimed so far in this pass (primary-box image, exact coordinates): two merges of equal masses on a regular
+           lattice can share a centre of mass (e.g. across the two diagonals of a lattice square) and would leave two cells at one point.
+           The later proposal, in list order, waits for the next pass, where its partner and result may differ. This only sees the
+           merges of this rank; two ranks can still, rarely, produce the same point across a domain boundary. A merge that would
+           land exactly on a cell that is already there (e.g. two cells two lattice spacings apart) waits too. */
+        std::set<std::array<double,3>> merged_positions_this_pass;
         for (int aa = 0; aa < num_src; aa++) {
             i = ms_src_idx[aa];
             /* A particle already claimed as somebody's merge target must not also
@@ -602,9 +596,23 @@ void merge_and_split_particles(void)
 #ifdef HYDRO_MULTIFLUID
                     if (do_allow_merger && !same_lagrangian_fluid_id(P[i].FluidType, P[j].FluidType)) {do_allow_merger = 0;}
 #endif
+#if defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS)
+                    if (do_allow_merger && (P[i].Type == 0) && (CellP[i].CompositionType != CellP[j].CompositionType)) {do_allow_merger = 0;} /* never merge two materials (gas into a solid, iron into rock) */
+#endif
                     if (do_allow_merger) {threshold_val=m_eff; target_for_merger=j;}
                 }
                 if (target_for_merger >= 0) {
+                    Vec3<MyDouble> pos_merged = merged_position(i, target_for_merger);
+                    box_wrap_position_to_primary_image(pos_merged);
+                    int lands_on_a_cell = 0; /* a cell already at that point lies within i's kernel, so in its neighbour list */
+                    for (int64_t nn = nl_start; nn < nl_end && !lands_on_a_cell; nn++) {
+                        int k = gnl_neighbors[nn];
+                        if ((k < 0) || (k >= local_count) || (k == i) || (k == target_for_merger) || !(P[k].Mass > 0)) continue;
+                        Vec3<double> dk = P[k].Pos - pos_merged; nearest_xyz(dk,-1);
+                        if (dk.norm_sq() == 0) {lands_on_a_cell = 1;}
+                    }
+                    if (lands_on_a_cell) {continue;}
+                    if (!merged_positions_this_pass.insert({(double)pos_merged[0], (double)pos_merged[1], (double)pos_merged[2]}).second) {continue;}
                     Ptmp[i].flag = 1; Ptmp[target_for_merger].flag = 3; Ptmp[i].target_index = target_for_merger;
                     ms_flagged.push_back(i);
                     ms_split_nearest_distance.push_back(0); /* kept aligned with ms_flagged; read only for splits */
@@ -665,19 +673,21 @@ void merge_and_split_particles(void)
 #endif
     myfree(Ptmp);
     
-    MPI_Allreduce(&n_particles_merged, &MPI_n_particles_merged, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(&n_particles_split, &MPI_n_particles_split, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(&n_particles_gas_split, &MPI_n_particles_gas_split, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    {
+        long long local[3] = {n_particles_merged, n_particles_split, n_particles_gas_split}, total[3];
+        MPI_Allreduce(local, total, 3, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        MPI_n_particles_merged = total[0]; MPI_n_particles_split = total[1]; MPI_n_particles_gas_split = total[2];
+    }
     if(ThisTask == 0)
     {
         if(MPI_n_particles_merged > 0 || MPI_n_particles_split > 0)
         {
-            printf("Particle split/merge check: %d particles merged, %d particles split (%d gas) \n", MPI_n_particles_merged,MPI_n_particles_split,MPI_n_particles_gas_split);
+            printf("Particle split/merge check: %lld particles merged, %lld particles split (%lld gas) \n", MPI_n_particles_merged,MPI_n_particles_split,MPI_n_particles_gas_split);
         }
     }
     /* the reduction or increase of n_part by MPI_n_particles_merged will occur in rearrange_particle_sequence, which -must- be called immediately after this routine! */
-    All.TotNumPart += (long long)MPI_n_particles_split;
-    All.TotN_gas += (long long)MPI_n_particles_gas_split;
+    All.TotNumPart += MPI_n_particles_split;
+    All.TotN_gas += MPI_n_particles_gas_split;
     Gas_split = n_particles_gas_split; // specific to the local processor //
     NumPart += (n_particles_split - n_particles_gas_split); // specific to the local processor; note the gas split number will be added below, this is just non-gas splits //
     gpu_particles_arena_invalidate(); /* NumPart and P[] indices changed; arena stale */
@@ -716,7 +726,6 @@ int split_particle_i(int i, int n_particles_split, double r_near)
         if(out_of_storage && UnmetSplitDemand < All.MaxPartExpandable) {UnmetSplitDemand++;}
         //printf ("On Task=%d with NumPart=%d we tried to split a particle, but there is no space left...(All.MaxPart=%d). Try using more nodes, or raising PartAllocFac, or changing the split conditions to avoid this.\n", ThisTask, NumPart, All.MaxPart); fflush(stdout);
         return 0;
-        endrun(8888);
     }
 #ifndef SPAWN_PARTICLES_VIA_SPLITTING
     if(P[i].Type != 0) {printf("Splitting Non-Gas Particle: i=%d ID=%llu Type=%d \n",i,(unsigned long long) P[i].ID,P[i].Type);} //fflush(stdout); endrun(8889);
@@ -727,8 +736,9 @@ int split_particle_i(int i, int n_particles_split, double r_near)
 
     int k; double phi,cos_theta;
     k=0;
-    phi = 2.0*M_PI*get_random_number(i+1+ThisTask); // random from 0 to 2pi //
-    cos_theta = 2.0*(get_random_number(i+3+2*ThisTask)-0.5); // random between 1 to -1 //
+    static constexpr uint64_t SPLIT_DIRECTION_RNG_SALT = gizmo_loop_rng_salt("split_direction");
+    phi = 2.0*M_PI*particle_random_number(i, SPLIT_DIRECTION_RNG_SALT, (uint64_t)All.Ti_Current, 0); // random from 0 to 2pi //
+    cos_theta = 2.0*(particle_random_number(i, SPLIT_DIRECTION_RNG_SALT, (uint64_t)All.Ti_Current, 1)-0.5); // random between 1 to -1 //
     /* set d_r to the Voronoi-optimal daughter offset: d = (V_daughter)^{1/NDIMS}/2 = 2^{-(NDIMS+1)/NDIMS} * dx_eff,
        placing each daughter at its sub-cell centroid. minimizes O(d^2) perturbations to neighbor density estimates
        while maintaining a glass-like configuration. dimension-general: 0.397*dx_eff in 3D, 0.354 in 2D, 0.25 in 1D */
@@ -781,7 +791,7 @@ int split_particle_i(int i, int n_particles_split, double r_near)
     if(P[i].Type==0) {CellP[j].Mass = P[j].Mass; CellP[i].Mass = P[i].Mass;} // CellP[] is sized All.MaxPartGas; only gas splits get CellP writes
 #ifdef BOX_BND_PARTICLES
     if(P[i].ID==0)  {P[j].ID=1; double m0=P[i].Mass+P[j].Mass; P[i].Mass=P[j].Mass=m0;}
-    if(P[i].Type==0) {CellP[i].Mass = P[i].Mass;}
+    if(P[i].Type==0) {CellP[i].Mass = P[i].Mass; CellP[j].Mass = P[j].Mass;}
 #endif
 
     /* prepare to shift the particle locations according to the random number we drew above */
@@ -920,7 +930,8 @@ int split_particle_i(int i, int n_particles_split, double r_near)
         if(norm > 0)
         {
             norm = 1/sqrt(norm);
-            double qq = get_random_number(63432*k + 84*i + 99*j + 358453 + 84537*ThisTask);
+            static constexpr uint64_t SPLIT_AXIS_SIGN_RNG_SALT = gizmo_loop_rng_salt("split_axis_sign");
+            double qq = particle_random_number(i, SPLIT_AXIS_SIGN_RNG_SALT, (uint64_t)All.Ti_Current, 0);
             if(qq < 0.5) {norm *= -1.;} // randomly decide which direction along principle axis to orient split (since this is arbitrary, this helps prevent accidental collisions)
             for(k=0;k<NUMDIMS;k++) {dp[k] *= norm;}
             /* project dp onto the isodensity plane (perpendicular to grad_rho): placing daughters on the same
@@ -982,6 +993,16 @@ int split_particle_i(int i, int n_particles_split, double r_near)
     all conserved quantities are appropriately dealt with. This also requires some care, to be
     done appropriately, but is a little bit less sensitive and more well-defined compared to
     particle splitting */
+/* where merging i into j puts the survivor: their centre of mass, measured from i across the nearest periodic image (the box wrap
+   after the merge pass then folds it into the primary box) */
+static Vec3<double> merged_position(int i, int j)
+{
+    double wt_j = P[j].Mass / (P[j].Mass + P[i].Mass);
+    Vec3<double> dp = P[j].Pos - P[i].Pos;
+    nearest_xyz(dp,-1);
+    return P[i].Pos + dp * wt_j;
+}
+
 int merge_particles_ij(int i, int j)
 {
     int k;
@@ -1000,6 +1021,9 @@ int merge_particles_ij(int i, int j)
     double wt_j = P[j].Mass / mtot;
     
     if(((P[i].Type==0)||(P[j].Type==0)) && (P[j].Type!=P[i].Type)) {printf("WARNING: code is trying to merge a gas cell with a non-gas particle. I dont know how to do this. Exiting the merge subroutine."); fflush(stdout); return 0;}
+#if defined(EOS_TILLOTSON) || defined(EOS_ELASTIC) || defined(EOS_ANEOS)
+    if((P[i].Type==0) && (CellP[i].CompositionType != CellP[j].CompositionType)) {printf("WARNING: code is trying to merge cells of two different materials (CompositionType %d and %d). Exiting the merge subroutine.\n", (int)CellP[i].CompositionType, (int)CellP[j].CompositionType); fflush(stdout); return 0;}
+#endif
 
     int swap_ids = 0; if(P[i].Mass > P[j].Mass) {swap_ids = 1;} /* retain the IDs of the more massive progenitor */
 #ifdef SINK_WIND_SPAWN
@@ -1026,13 +1050,14 @@ int merge_particles_ij(int i, int j)
     // block for merging non-gas particles (much simpler, assume collisionless)
     if((P[i].Type>0)&&(P[j].Type>0))
     {
-        Vec3<double> dp = P[j].Pos - P[i].Pos;
-        nearest_xyz(dp,-1);
         Vec3<double> p_old_i = P[i].Vel * P[i].Mass;
         Vec3<double> p_old_j = P[j].Vel * P[j].Mass;
-        P[j].Pos = P[i].Pos + dp * wt_j; // center-of-mass conserving //
+        P[j].Pos = merged_position(i, j); // center-of-mass conserving //
         P[j].Vel = P[j].Vel * wt_j + P[i].Vel * wt_i; // momentum-conserving //
         P[j].GravAccel = P[j].GravAccel * wt_j + P[i].GravAccel * wt_i; // force-conserving //
+#ifdef GRAVACCEL_RETAINED_ON_SKIPPED_WALK
+        P[j].GravAccel_Retained = P[j].GravAccel_Retained * wt_j + P[i].GravAccel_Retained * wt_i;
+#endif
 #ifdef PMGRID
         P[j].GravPM = P[j].GravPM * wt_j + P[i].GravPM * wt_i; // force-conserving //
 #endif
@@ -1104,9 +1129,7 @@ int merge_particles_ij(int i, int j)
     egy_old += mtot * (wt_j*CellP[j].InternalEnergy + wt_i*CellP[i].InternalEnergy); // internal energy //
     /* for periodic boxes, we need to (arbitrarily) pick one position as our coordinate center. we pick i. then everything defined in
         position differences relative to i. the final position will be appropriately box-wrapped after these operations are completed */
-    Vec3<double> dp = P[j].Pos - P[i].Pos;
-    nearest_xyz(dp,-1);
-    Vec3<double> pos_new = P[i].Pos + dp * wt_j;
+    Vec3<double> pos_new = merged_position(i, j);
 
     egy_old += mtot*wt_j * 0.5 * P[j].Vel.norm_sq() * All.cf_a2inv; // kinetic energy (j) //
     egy_old += mtot*wt_i * 0.5 * P[i].Vel.norm_sq() * All.cf_a2inv; // kinetic energy (i) //
@@ -1142,6 +1165,9 @@ int merge_particles_ij(int i, int j)
     CellP[j].InternalEnergyPred = wt_j*CellP[j].InternalEnergyPred + wt_i*CellP[i].InternalEnergyPred;
     CellP[j].MeanMolecularWeight = wt_j*CellP[j].MeanMolecularWeight + wt_i*CellP[i].MeanMolecularWeight; /* cached composition mixes with the mass, as the other terms do */
     CellP[j].Gamma = wt_j*CellP[j].Gamma + wt_i*CellP[i].Gamma;
+#ifdef EOS_ELASTIC
+    if(solid_material_is_elastic(CellP[j].CompositionType)) {CellP[j].RecentYieldMemory = DMAX(CellP[j].RecentYieldMemory, CellP[i].RecentYieldMemory);} /* the merged element keeps the tensile correction off if either part was flowing plastically; a gas survivor carries none */
+#endif
 /* the electron and neutral fractions are part of the same cached composition and mix the same way. each
    is declared by whichever of the cooling and photo-ionization modules owns it, so each line carries that
    field's own existence condition; they differ because only the neutral fraction is declared when the
@@ -1152,7 +1178,7 @@ int merge_particles_ij(int i, int j)
 #if (defined(COOLING) && !defined(CHIMES)) || (defined(RADTRANSFER) && defined(RT_CHEM_PHOTOION))
     CellP[j].HI = wt_j*CellP[j].HI + wt_i*CellP[i].HI;
 #endif
-#if defined(RADTRANSFER) && defined(RT_CHEM_PHOTOION)
+#if (defined(RADTRANSFER) && defined(RT_CHEM_PHOTOION)) || (defined(EXTERNAL_CHEMISTRY_REPORTS_SPECIES) && !defined(CHIMES))
     /* the ionization states are a partition of the same nuclei as the neutral fraction above, so they
        have to mix with it or the merged cell holds fractions that no longer sum correctly */
     CellP[j].HII = wt_j*CellP[j].HII + wt_i*CellP[i].HII;
@@ -1162,12 +1188,36 @@ int merge_particles_ij(int i, int j)
     CellP[j].HeIII = wt_j*CellP[j].HeIII + wt_i*CellP[i].HeIII;
 #endif
 #endif
+#if defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY > 0)
+    /* grackle's species are fractions of the total mass, so they mix by mass */
+    CellP[j].grHI = wt_j*CellP[j].grHI + wt_i*CellP[i].grHI; CellP[j].grHII = wt_j*CellP[j].grHII + wt_i*CellP[i].grHII; CellP[j].grHM = wt_j*CellP[j].grHM + wt_i*CellP[i].grHM;
+    CellP[j].grHeI = wt_j*CellP[j].grHeI + wt_i*CellP[i].grHeI; CellP[j].grHeII = wt_j*CellP[j].grHeII + wt_i*CellP[i].grHeII; CellP[j].grHeIII = wt_j*CellP[j].grHeIII + wt_i*CellP[i].grHeIII;
+#if (COOL_GRACKLE_CHEMISTRY >= 2)
+    CellP[j].grH2I = wt_j*CellP[j].grH2I + wt_i*CellP[i].grH2I; CellP[j].grH2II = wt_j*CellP[j].grH2II + wt_i*CellP[i].grH2II;
+#endif
+#if (COOL_GRACKLE_CHEMISTRY >= 3)
+    CellP[j].grDI = wt_j*CellP[j].grDI + wt_i*CellP[i].grDI; CellP[j].grDII = wt_j*CellP[j].grDII + wt_i*CellP[i].grDII; CellP[j].grHDI = wt_j*CellP[j].grHDI + wt_i*CellP[i].grHDI;
+#endif
+#endif
+#if defined(COOL_MOLECFRAC_NONEQM)
+    /* the H2 mass is conserved (the fraction of the hydrogen mass in H2 mixes by mass), and the fraction of the neutral gas the network
+       evolves follows from it by the relation the network uses, MolecularMassFraction = (1 - Ne/1.25) * MolecularMassFraction_perNeutralH,
+       at the merged Ne; a merged cell cannot hold more H2 than neutral gas */
+    {
+        double f_neutral = DMIN(1, DMAX(0, 1. - CellP[j].Ne/1.25)), f_H2 = wt_j*CellP[j].MolecularMassFraction + wt_i*CellP[i].MolecularMassFraction;
+        CellP[j].MolecularMassFraction_perNeutralH = (f_neutral > 0) ? DMIN(1, f_H2 / f_neutral) : 0;
+        CellP[j].MolecularMassFraction = f_neutral * CellP[j].MolecularMassFraction_perNeutralH;
+    }
+#endif
     Vec3<double> p_old_i = P[i].Vel * P[i].Mass;
     Vec3<double> p_old_j = P[j].Vel * P[j].Mass;
     P[j].Pos = pos_new; // center-of-mass conserving //
     P[j].Vel = P[j].Vel * wt_j + P[i].Vel * wt_i; // momentum-conserving //
     CellP[j].VelPred = CellP[j].VelPred * wt_j + CellP[i].VelPred * wt_i; // momentum-conserving //
     P[j].GravAccel = P[j].GravAccel * wt_j + P[i].GravAccel * wt_i; // force-conserving //
+#ifdef GRAVACCEL_RETAINED_ON_SKIPPED_WALK
+    P[j].GravAccel_Retained = P[j].GravAccel_Retained * wt_j + P[i].GravAccel_Retained * wt_i;
+#endif
 #ifdef PMGRID
     P[j].GravPM = P[j].GravPM * wt_j + P[i].GravPM * wt_i; // force-conserving //
 #endif
@@ -1184,6 +1234,11 @@ int merge_particles_ij(int i, int j)
 #endif
     //CellP[j].DtB = CellP[i].DtB = {}; CellP[j].BPred = CellP[j].B; CellP[i].BPred = CellP[i].B; /* zero the time derivatives and cleaning terms: these will be re-calculated self-consistently from the new mesh configuration */
     CellP[j].divB += CellP[i].divB; // CellP[i].divB = CellP[j].divB = 0; /* this is a conserved quantity (volume-integrated) so can simply be added */
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+    { double wt_vol_i = volume_before_merger_i / (volume_before_merger_i + volume_before_merger_j), wt_vol_j = 1. - wt_vol_i; /* the evolved non-ideal field is intensive (not volume-integrated): volume-weighted mean */
+    CellP[j].NonIdealMHDFlux = wt_vol_j * CellP[j].NonIdealMHDFlux + wt_vol_i * CellP[i].NonIdealMHDFlux;
+    CellP[j].NonIdealMHDFluxPred = wt_vol_j * CellP[j].NonIdealMHDFluxPred + wt_vol_i * CellP[i].NonIdealMHDFluxPred; }
+#endif
 #ifdef DIVBCLEANING_DEDNER
     CellP[j].Phi += CellP[i].Phi; CellP[j].PhiPred += CellP[i].PhiPred; CellP[j].DtPhi += CellP[i].DtPhi; CellP[j].DtB_PhiCorr += CellP[i].DtB_PhiCorr; /* on a merge, can simply add all of these conservative quantities */
     //CellP[i].Phi = CellP[i].PhiPred = CellP[i].DtPhi = CellP[j].Phi = CellP[j].PhiPred = CellP[j].DtPhi = 0; CellP[i].DtB_PhiCorr = CellP[j].DtB_PhiCorr = {}; /* zero the time derivatives and cleaning terms: these will be re-calculated self-consistently from the new mesh configuration */
@@ -1227,6 +1282,18 @@ int merge_particles_ij(int i, int j)
 #ifdef ENERGY_ENTROPY_SWITCH_IS_ACTIVE
     CellP[j].MaxKineticEnergyNgb = DMAX(CellP[j].MaxKineticEnergyNgb,CellP[i].MaxKineticEnergyNgb); /* for the entropy/energy switch condition */
 #endif
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS)
+    if(CellP[i].ElasticImpedanceNeighbour) {CellP[j].ElasticImpedanceNeighbour = 1;} /* the merged cell covers both volumes: keep the timestep cap if either was beside a solid */
+#endif
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+    if(CellP[i].SolidBesideGas && !CellP[j].SolidBesideGas) {CellP[j].SolidBesideGas = 1; CellP[j].SolidVelocityDivergence = CellP[i].SolidVelocityDivergence;} /* and keep its own integrated volume until its next gradient pass */
+#endif
+#ifdef HYDRO_EXPLICITLY_INTEGRATE_VOLUME
+    {   /* the merged cell's integrated density: the two masses over the two integrated volumes (a cell beside gas never relaxes it back) */
+        double rho_explicit_i = CellP[i].Density_ExplicitInt, rho_explicit_j = CellP[j].Density_ExplicitInt;
+        if(rho_explicit_i > 0 && rho_explicit_j > 0) {CellP[j].Density = CellP[j].Density_ExplicitInt = (mass_before_merger_i + mass_before_merger_j) / (mass_before_merger_i/rho_explicit_i + mass_before_merger_j/rho_explicit_j);}
+    }
+#endif
 
     // below, we need to take care of additional physics //
 #if defined(RADTRANSFER)
@@ -1266,7 +1333,8 @@ int merge_particles_ij(int i, int j)
     wt_h_i = 1.0;
     wt_h_j = 1.0;
 #endif
-    for (k = 0; k < ChimesGlobalVars.totalNumberOfSpecies; k++) {ChimesGasVars[j].abundances[k] = (ChimesFloat) ((ChimesGasVars[j].abundances[k] * wt_j * wt_h_j) + (ChimesGasVars[i].abundances[k] * wt_i * wt_h_i));}
+    /* abundances are per hydrogen nucleus, so the parents mix by their hydrogen mass and the sum is divided by the merged hydrogen mass */
+    for (k = 0; k < ChimesGlobalVars.totalNumberOfSpecies; k++) {ChimesGasVars[j].abundances[k] = (ChimesFloat) (((ChimesGasVars[j].abundances[k] * wt_j * wt_h_j) + (ChimesGasVars[i].abundances[k] * wt_i * wt_h_i)) / ((wt_j * wt_h_j) + (wt_i * wt_h_i)));}
 #endif // CHIMES
 #ifdef METALS
     for(k=0;k<NUM_METAL_SPECIES;k++) {P[j].Metallicity[k] = wt_j*P[j].Metallicity[k] + wt_i*P[i].Metallicity[k];} /* metal-mass conserving (includes nuclear species) */
@@ -1286,6 +1354,14 @@ int merge_particles_ij(int i, int j)
     }
 #endif
 #endif
+#endif
+#ifdef CHIMES
+#if defined(METALS) && defined(COOL_METAL_LINES_BY_SPECIES)
+    chimes_update_element_abundances(j, P, CellP); /* the merged metallicity sets the element abundances the chemistry, and its mean molecular weight, use */
+#endif
+    chimes_cache_solved_state(j, CellP[j].InternalEnergy, CellP); /* the merged cell's chemistry, from the abundances and elements just mixed, at the energy it now holds */
+#elif defined(COOL_GRACKLE) && (COOL_GRACKLE_CHEMISTRY > 0)
+    grackle_cache_species_state(j); /* the merged cell's cached species, from grackle's species and the metallicity just mixed */
 #endif
 #if defined(SINK_THERMALFEEDBACK)
     CellP[j].Injected_Sink_Energy += CellP[i].Injected_Sink_Energy; /* pending energy (not specific): the survivor keeps both */
@@ -1456,7 +1532,8 @@ void rearrange_particle_sequence(int tree_rebuilt_before_next_walk)
        "eliminate" zero-mass ghost copies and shrink NumPart under the pool. */
     if(ghost_require_no_live_pool_for_layout_change("rearrange_particle_sequence")) {return;}
     int i, j, flag = 0, flag_sum, j_next;
-    int count_elim, count_gaselim, count_sink_elim, tot_elim, tot_gaselim, tot_sink_elim;
+    int count_elim, count_gaselim, count_sink_elim;
+    long long tot_elim, tot_gaselim, tot_sink_elim;   /* summed over ranks */
     struct particle_data psave;
     struct gas_cell_data gascellsave;
 #ifdef CHIMES
@@ -1588,13 +1665,15 @@ void rearrange_particle_sequence(int tree_rebuilt_before_next_walk)
         }
     NumPart = numpart_local; N_gas = ngas_local; /* publish compacted counts once */
 
-    MPI_Allreduce(&count_elim, &tot_elim, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(&count_gaselim, &tot_gaselim, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(&count_sink_elim, &tot_sink_elim, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    {
+        long long local[3] = {count_elim, count_gaselim, count_sink_elim}, total[3];
+        MPI_Allreduce(local, total, 3, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        tot_elim = total[0]; tot_gaselim = total[1]; tot_sink_elim = total[2];
+    }
 
     if(count_elim) {flag = 1;}
 
-    if(ThisTask == 0) {if(tot_elim > 0) {printf("Rearrange: Eliminated %d/%d gas/star particles and merged away %d sink particles.\n", tot_gaselim, tot_elim - tot_gaselim - tot_sink_elim, tot_sink_elim);}}
+    if(ThisTask == 0) {if(tot_elim > 0) {printf("Rearrange: Eliminated %lld/%lld gas/star particles and merged away %lld sink particles.\n", tot_gaselim, tot_elim - tot_gaselim - tot_sink_elim, tot_sink_elim);}}
 
     All.TotNumPart -= tot_elim;
     All.TotN_gas -= tot_gaselim;
@@ -1686,13 +1765,17 @@ int evaluate_starstar_merger_for_starcluster_eligibility(int i)
 
 #if defined(FIRE_SUPERLAGRANGIAN_JEANS_REFINEMENT) || defined(SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM)
 /* subroutine to check if too little time has passed since the last merge-split, in which case we won't allow it again */
-int check_if_sufficient_mergesplit_time_has_passed(int i, gizmo_rng_t *rng)
+int check_if_sufficient_mergesplit_time_has_passed(int i)
 {
     double N_timesteps_fac = 300.; // require > N timesteps before next merge/split, default was 100, but can be more aggressive - something between 10-100 works well in practice [definitely shorter than 10 can cause problems]
 #if (SINGLE_STAR_AND_SSP_NUCLEAR_ZOOM_SPECIALBOUNDARIES >= 2) || defined(FIRE_SUPERLAGRANGIAN_JEANS_REFINEMENT)
     N_timesteps_fac = 30.;
 #endif
-    if(P[i].Time_Of_Last_MergeSplit <= All.TimeBegin) {N_timesteps_fac *= 10. * gizmo_rng_uniform(rng);} // spread initial timing out over a broader range so it doesn't all happen at once after the startup
+    if(P[i].Time_Of_Last_MergeSplit <= All.TimeBegin) /* spread initial timing out over a broader range so it doesn't all happen at once after the startup: one fixed delay per element, drawn from its identity alone so it is the same at every check */
+    {
+        static constexpr uint64_t STARTUP_DELAY_RNG_SALT = gizmo_loop_rng_salt("initial_merge_split_delay");
+        N_timesteps_fac *= 10. * gizmo_gpu_rand_double(gizmo_rng_particle_identity_key(P[i]), gizmo_rng_event_counter(STARTUP_DELAY_RNG_SALT, 0, 0));
+    }
     double dtime_code = All.Time - P[i].Time_Of_Last_MergeSplit; // time [in code units] since last merge/split
     double dt_incodescale = (get_particle_timestep_in_physical(i, P) * All.cf_hubble_a) * All.cf_atime; // timestep converted appropriately to code units [physical if non-comoving, else scale factor]
     if(dtime_code < N_timesteps_fac*dt_incodescale) {return 0;} // not enough time passed, prohibit

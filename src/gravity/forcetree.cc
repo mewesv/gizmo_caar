@@ -175,6 +175,13 @@ static int tree_allocated_flag = 0;
  *  must know (the particle-storage resize, which may not release capacity under a standing tree)
  *  ask here rather than inferring it from MaxNodes or a live pointer. */
 int force_tree_is_allocated(void) {return tree_allocated_flag;}
+/* Imported foreign subtrees are read only by the gravity walks and SUBFIND's potential walk; every neighbour
+   walk skips them and stops at a remote top leaf.  Without either consumer no subtree is imported, the foreign
+   index range is empty, and foreign top leaves keep pointing at their pseudo-particles. */
+#if !defined(SELFGRAVITY_OFF) || defined(SUBFIND)
+#define TREE_IMPORTS_FOREIGN_SUBTREES
+#endif
+
 /* The foreign storage this rank reserves for the gravity tree, derived from its own past demand: raised whenever a
    force_treebuild_gravity build that finished its LET exchange over the whole tree needed more, to that import or a
    quarter above the old reservation, whichever is larger (so it can exceed any import seen so far).  The gravity
@@ -611,7 +618,11 @@ let_build_attempt:
      * receiver needed. The pseudodata Iallgatherv posted just above must still be
      * completed regardless, so no early return here. */
     long long foreign_needed = 0;
+#ifdef TREE_IMPORTS_FOREIGN_SUBTREES
     let_exchange_status_t let_status = let_run_exchange(&foreign_needed);
+#else
+    let_exchange_status_t let_status = LET_OK;   /* no consumer of imported subtrees in this build */
+#endif
     int pseudo_status = force_exchange_pseudodata_complete();
 
     /* Classify globally (worst status wins). A send-buffer malloc failure
@@ -705,7 +716,9 @@ let_build_attempt:
         /* Success: foreign moments complete. Scatter AoS→SoA, finalize LET
          * completeness, then re-sum ancestor topnode moments. */
         if(gpu_scatter_pseudo_to_soa() != 0)    {endrun(90000073);}
+#ifdef TREE_IMPORTS_FOREIGN_SUBTREES
         let_finalize_unredirected_foreign_topleaves();
+#endif
         if(gpu_topnode_moment_resum() != 0)     {endrun(90000074);}
         if(building_gravity_tree && !not_whole_tree_any && foreign_needed > remembered_foreign_slots)
         {
@@ -720,19 +733,25 @@ let_build_attempt:
        under a top node owned by another task is detached and then appears in NO rank's tree:
        absent from every multipole moment, contributing to no force, and otherwise silent. The
        test is on the count rather than the mass because node masses are MyFloat, so one particle
-       lost in a million falls below the accumulated summation error. Warn rather than abort, so a
-       false positive cannot kill a long run. Group finding builds over subsets, whose root
-       legitimately holds fewer, hence the veto reduced above. */
+       lost in a million falls below the accumulated summation error. A failure stops the run: the
+       forces after it are wrong, and the count is exact, so there is no false positive to tolerate.
+       Every rank holds the same root count (the top-leaf counts are exchanged), so every rank
+       requests the stop. Group finding builds over subsets, whose root legitimately holds fewer,
+       hence the veto reduced above. */
     if(!not_whole_tree_any)
     {
         long long in_tree = (long long) Nodes[All.TreeNodeIndexBase].N_part;
-        if(in_tree != (long long) All.TotNumPart && ThisTask == 0)
+        if(in_tree != (long long) All.TotNumPart)
         {
-            printf("WARNING: tree integrity check failed: root node holds %lld particles, expected %lld. "
-                   "Particles missing from the tree contribute to no rank's multipole moments, so the "
-                   "forces on everything else are wrong by their mass.\n",
-                   in_tree, (long long) All.TotNumPart);
-            fflush(stdout);
+            if(ThisTask == 0)
+            {
+                printf("STOP: tree integrity check failed: root node holds %lld particles, expected %lld. "
+                       "Particles missing from the tree contribute to no rank's multipole moments, so the "
+                       "forces on everything else are wrong by their mass. Stopping.\n",
+                       in_tree, (long long) All.TotNumPart);
+                fflush(stdout);
+            }
+            endrun(90000102);
         }
     }
 
@@ -788,6 +807,7 @@ int force_treebuild_single(int npart, struct unbind_data *mp)
     peanokey key, morton, th_key, *morton_list;
     
     nlr_mode_d_packet_tree_rebuilt();   /* every build, in place or not: the packet walk's top-level order is recomputed */
+    gx_top_leaf_map_tree_rebuilt();     /* and Mode D's top-leaf map is rebuilt on its next use */
     /* create an empty root node  */
     nfree = All.TreeNodeIndexBase;        /* index of first free node */
     nfreep = &Nodes[nfree];    /* select first node */
@@ -3616,7 +3636,8 @@ void force_treeallocate(int maxnodes, int tree_particle_slots, int foreign_node_
      * and serializes nothing, so it derives normally.
      * Numforeignnodes (current count, <= AllocatedForeignNodes <= MaxForeignNodes) is reset on each
      * LET exchange.  The range is empty (MaxForeignNodes = 0) only before the first tree is
-     * allocated, or when a restart file carries none. */
+     * allocated, when a restart file carries none, or in a build that never imports
+     * (TREE_IMPORTS_FOREIGN_SUBTREES undefined). */
     if(foreign_node_slots_exact >= 0)
     {
         /* Restart read: the index ceiling the file's node pointers were written against, not an
@@ -3637,6 +3658,9 @@ void force_treeallocate(int maxnodes, int tree_particle_slots, int foreign_node_
          * when an import does not fit the index range). This is the SOLE place MaxForeignNodes is
          * derived. */
         long long want = (base > RuntimeMinLETForeignNodes) ? base : RuntimeMinLETForeignNodes;
+#ifndef TREE_IMPORTS_FOREIGN_SUBTREES
+        want = 0;   /* nothing is ever imported */
+#endif
         if(want < 0) want = 0;
         if(want > (long long)INT_MAX)
         {
@@ -4026,6 +4050,7 @@ void force_treefree(void)
         gpu_gravity_tree_release();
         gpu_leaf_mirror_release();   /* the device leaf mirror lives and dies with the tree */
         nlr_mode_d_packet_workspace_release();   /* so does the packet walk's workspace (its top-level order is this tree's) */
+        gx_top_leaf_map_release();               /* and Mode D's top-leaf map */
         if(Nextnode)      {gpu_tree_free_bytes(Nextnode);      Nextnode      = NULL;}
         if(Extnodes_base) {gpu_tree_free_bytes(Extnodes_base); Extnodes_base = NULL;}
         if(Nodes_base)    {gpu_tree_free_bytes(Nodes_base);    Nodes_base    = NULL;}

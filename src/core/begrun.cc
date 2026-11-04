@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "../system/timer.h"
 #include "../declarations/allvars.h"
@@ -236,7 +237,6 @@ void begrun(void)
 
 
 
-  gizmo_rng_init(&random_generator, (uint64_t)(42 + ThisTask));
 
 #ifdef PMGRID
   if(RestartFlag != 3 && RestartFlag != 4) {long_range_init();}
@@ -260,6 +260,11 @@ void begrun(void)
         int aneos_ierr = aneos_read_table(All.AneosTableFiles[aneos_k], aneos_k);
         if(aneos_ierr) {printf("ANEOS: error loading table %d from %s\n", aneos_k, All.AneosTableFiles[aneos_k]); endrun(1);}
     }
+#endif
+
+#ifdef EOS_ELASTIC
+    solid_material_resolve(); /* strength/damage/porosity per CompositionType, from the presets and the parameterfile, before init() uses them */
+    if(gizmo_poll_controlled_stop()) return;
 #endif
 
 #ifdef NUCLEAR_NETWORK
@@ -323,7 +328,13 @@ void begrun(void)
       All.NeighborLoopModeBThresholdMax = all.NeighborLoopModeBThresholdMax;
       All.NeighborLoopModeDThresholdSum = all.NeighborLoopModeDThresholdSum;
       All.NeighborLoopModeDThresholdMax = all.NeighborLoopModeDThresholdMax;
+      All.GPUElementOffloadMinCount = all.GPUElementOffloadMinCount;
+      All.GPUTreeOffloadMinCount = all.GPUTreeOffloadMinCount;
+      All.GPUParticleLoopOffloadMinCount = all.GPUParticleLoopOffloadMinCount;
+      All.GPUDriftOffloadMinCount = all.GPUDriftOffloadMinCount;
+      All.GPUTreeWalkOffloadMinCount = all.GPUTreeWalkOffloadMinCount;
       All.GravityHostWalkBelowActive = all.GravityHostWalkBelowActive;
+      All.HostThreadMinCount = all.HostThreadMinCount;
       All.TreeUpdateHostBelowActive = all.TreeUpdateHostBelowActive;
       All.TreeUpdateFullSweep_ActiveFraction = all.TreeUpdateFullSweep_ActiveFraction;
       /* The rest of this block is the same kind of thing: how accurately or how often something is
@@ -626,6 +637,22 @@ void begrun(void)
 #endif
 #ifdef RADTRANSFER
     rt_set_simple_inits(RestartFlag);
+#endif
+#if defined(COOLING) && defined(EXTERNAL_CHEMISTRY_REPORTS_SPECIES)
+    if(RestartFlag != 1) /* the external chemistry's species are in place now (from the IC file or snapshot, or CHIMES's equilibrium start): fill the cache the rest of the code reads from the cell. a restart restores it with the cells. this runs after rt_set_simple_inits, which resets the radiation chemistry's ionization states */
+    {
+        for(int ig = 0; ig < N_gas; ig++)
+        {
+#if defined(CHIMES)
+            chimes_cache_solved_state(ig, CellP[ig].InternalEnergy, CellP);
+#ifdef CHIMES_TURB_DIFF_IONS
+            chimes_update_turbulent_abundances(ig, 1, P, CellP); /* the abundance-times-mass the turbulent ion diffusion carries */
+#endif
+#elif defined(COOL_GRACKLE)
+            grackle_cache_species_state(ig);
+#endif
+        }
+    }
 #endif
 
 
@@ -1183,6 +1210,165 @@ void report_parameters_a_restart_cannot_change(const void *from_file)
     if(reported) {printf("\n"); fflush(stdout);}
 }
 
+/* The per-MPI-task counts from which work moves from the host to the device.  Two anchors set the defaults of the counts
+ * that scale with them, and every count that has a control of its own keeps it as an override:
+ *   GPUElementOffloadMinCount (elements): per-particle loops use it, the particle drift a quarter of it.
+ *   GPUTreeOffloadMinCount (tree-walk sources): the neighbour-loop walk batch uses it, the gravity walk a quarter of it,
+ *     and the spatial-index builds 2x (imported members), 32x (own members to be sorted) and 64x (own members in order).
+ * An own control of -1 takes the anchor's value, 0 sends the work to the device whenever there is any, a positive value is exact.
+ * Every default was measured on Frontier, an MI250X GCD against 7 OpenMP threads, so on a machine with another host-thread
+ * count per device these are starting points, not constants of nature.
+ *   Per-particle loops: a kernel launch and the staging copies cost a fixed amount that the per-element work of cooling,
+ *     the nuclear network and the like must exceed.
+ *   Drift: its per-element work is far smaller, so it wants a lower count.  Where the particle arrays are device-visible the
+ *     device drift works on them in place.  Measured on a 128-rank galaxy run at matched time, the host is ahead by ~0.3 ms
+ *     per step up to ~1e3 particles in all, and the two tie from ~1e4 in all, where the busiest ranks hold ~1e3 each.  That
+ *     is for a cheap equation of state; a tabulated or solid one makes the device's share grow.
+ *   Tree-walk batch: a three-way choice -- fewer sources than the host-thread count below run on one host core, fewer than this count
+ *     on the host threads, at or above it on the device.  The lower boundary is the neighbour-loop runner's own OpenMP floor,
+ *     so a count at or below it leaves the threaded tier empty.  A walk is a dependent chain per source: a small batch gives
+ *     the device nothing to overlap while it still pays a launch and a fence.  Device batches below this count were measured
+ *     3-7x slower per member than the host tier (FIRE-dwarf, a FIRE zoom-in), and moving every batch below it to the device
+ *     cost 231 s of a 685 s run on a 128-rank cosmological zoom.  Decided per batch and per rank from that batch's own source
+ *     count, because a rank's own actives and the queries it received differ by orders of magnitude inside one call.
+ *     This prices the device walk as it is today; the deficit at small batches is a defect of that walk still being worked off
+ *     (row D-GPU), so the count is to be re-measured as the walk improves, not inherited.
+ *   Gravity walk: the walk of a rank with fewer active candidates runs on the host.
+ *   Spatial-index builds: a device build pays about a millisecond in launches, staging and allocation and then runs several
+ *     times faster per member.  Imported builds cross over between 4096 and 8192 particles; full-rank owned builds of
+ *     0.5-1.1M members run 4.5x (sorted) and 2.2x (in order) faster on the device, ~30k-member owned builds are still slower
+ *     there, and an in-order build skips the passes the device speeds up most, so its crossover lies higher. */
+static const int GPU_OFFLOAD_DEFAULT_ANCHOR = 4096;
+struct GpuOffloadRule
+{
+    const char *what;                       /* named in the startup report */
+    int global_data_all_processes::*own;    /* the control that sets this count by itself, or null */
+    const char *own_name;
+    int global_data_all_processes::*anchor; /* the anchor that sets its default */
+    const char *anchor_name;
+    int times, per;                         /* the default is anchor * times / per */
+};
+static constexpr GpuOffloadRule gpu_offload_rules[GPU_OFFLOAD_NUM_SITES] =   /* in the order of enum GizmoOffloadSite */
+{
+    {"per-particle loops",                          &global_data_all_processes::GPUParticleLoopOffloadMinCount, "GPUParticleLoopOffloadMinCount", &global_data_all_processes::GPUElementOffloadMinCount, "GPUElementOffloadMinCount", 1, 1},
+    {"particle drift",                              &global_data_all_processes::GPUDriftOffloadMinCount,        "GPUDriftOffloadMinCount",        &global_data_all_processes::GPUElementOffloadMinCount, "GPUElementOffloadMinCount", 1, 4},
+    {"neighbour-loop tree-walk batch",              &global_data_all_processes::GPUTreeWalkOffloadMinCount,     "GPUTreeWalkOffloadMinCount",     &global_data_all_processes::GPUTreeOffloadMinCount,    "GPUTreeOffloadMinCount",    1, 1},
+    {"gravity tree walk",                           &global_data_all_processes::GravityHostWalkBelowActive,     "GravityHostWalkBelowActive",     &global_data_all_processes::GPUTreeOffloadMinCount,    "GPUTreeOffloadMinCount",    1, 4},
+    {"spatial-index build, own members in order",   nullptr, nullptr,                                                                                &global_data_all_processes::GPUTreeOffloadMinCount,    "GPUTreeOffloadMinCount",    64, 1},
+    {"spatial-index build, own members sorted",     nullptr, nullptr,                                                                                &global_data_all_processes::GPUTreeOffloadMinCount,    "GPUTreeOffloadMinCount",    32, 1},
+    {"spatial-index build, imported members",       nullptr, nullptr,                                                                                &global_data_all_processes::GPUTreeOffloadMinCount,    "GPUTreeOffloadMinCount",    2, 1},
+};
+static_assert(gpu_offload_rules[GPU_OFFLOAD_NUM_SITES - 1].what != nullptr, "a count of GizmoOffloadSite has no row");
+static_assert(gpu_offload_rules[GPU_OFFLOAD_SIDX_OWNED_PRESORTED].times == 64 && gpu_offload_rules[GPU_OFFLOAD_SIDX_OWNED_SORTED].times == 32 &&
+              gpu_offload_rules[GPU_OFFLOAD_SIDX_IMPORTED].times == 2, "the spatial-index rows are out of the order of GizmoOffloadSite");
+enum {GPU_OFFLOAD_FROM_DEFAULT = 0, GPU_OFFLOAD_FROM_OWN_CONTROL = 1, GPU_OFFLOAD_FROM_ANCHOR = 2};
+
+static int gpu_offload_resolve(int site, int *origin)
+{
+    const GpuOffloadRule &rule = gpu_offload_rules[site];
+    if(rule.own) {
+        const int own = All.*(rule.own);
+        if(own >= 0) {if(origin) {*origin = GPU_OFFLOAD_FROM_OWN_CONTROL;} return own;}
+    }
+    const int anchor_set = All.*(rule.anchor);
+    const long long anchor = (anchor_set >= 0) ? anchor_set : GPU_OFFLOAD_DEFAULT_ANCHOR;
+    if(origin) {*origin = (anchor_set >= 0) ? GPU_OFFLOAD_FROM_ANCHOR : GPU_OFFLOAD_FROM_DEFAULT;}
+    const long long count = anchor * rule.times / rule.per;
+    return (count > INT_MAX) ? INT_MAX : (int) count;
+}
+
+int gizmo_gpu_offload_min_count(enum GizmoOffloadSite site)
+{
+    return gpu_offload_resolve((int) site, nullptr);
+}
+
+/* A count of 0 means "the device whenever there is any work", and an empty batch is none: the device paths allocate
+ * for their batch and take no zero-size launch. */
+int gizmo_gpu_offload_takes(enum GizmoOffloadSite site, long long count)
+{
+    return (count > 0 && count >= (long long) gpu_offload_resolve((int) site, nullptr)) ? 1 : 0;
+}
+
+/* The per-MPI-task counts from which a host loop runs on all OpenMP threads.  One anchor, HostThreadMinCount, sets them all;
+ * unset, it is max(64, 4 x threads): starting the threads must be repaid by a few items each, and that floor grows with the
+ * thread count.  Each kind of loop scales it by how much work one item is:
+ *   Neighbour-loop work (host walks, evaluations, writebacks): the anchor itself.
+ *   Per-particle loops: a quarter of it, since one element's update costs several times a neighbour-loop item's bookkeeping.
+ *   Bookkeeping (a few operations or a copy per item): 64 times it, since such an item repays almost none of the start.
+ * At 16 or fewer threads these give 64, 16 and 4096: the first two are the values the code used before they were collected here,
+ * the last a starting value for loops that do almost nothing per item; none is a measured crossover. */
+static const int HOST_THREAD_DEFAULT_FLOOR = 64, HOST_THREAD_DEFAULT_PER_THREAD = 4;
+struct HostThreadRule {const char *what; int times, per;};   /* the count is the anchor * times / per, rounded up */
+static constexpr HostThreadRule host_thread_rules[HOST_THREAD_NUM_SITES] =   /* in the order of enum GizmoHostThreadSite */
+{
+    {"per-particle loops",       1, 4},
+    {"neighbour-loop host work", 1, 1},
+    {"bookkeeping loops",       64, 1},
+};
+static_assert(host_thread_rules[HOST_THREAD_NUM_SITES - 1].what != nullptr, "a count of GizmoHostThreadSite has no row");
+
+int gizmo_host_thread_count(void)
+{
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+static long long host_thread_resolve(int site, int nthreads)
+{
+    const long long default_anchor = (HOST_THREAD_DEFAULT_PER_THREAD * (long long) nthreads > HOST_THREAD_DEFAULT_FLOOR) ?
+                                     HOST_THREAD_DEFAULT_PER_THREAD * (long long) nthreads : HOST_THREAD_DEFAULT_FLOOR;
+    const long long anchor = (All.HostThreadMinCount >= 0) ? All.HostThreadMinCount : default_anchor;
+    const long long per = host_thread_rules[site].per;
+    return (anchor * host_thread_rules[site].times + per - 1) / per;   /* rounded up, so only an anchor of 0 threads every loop that has work */
+}
+
+int gizmo_host_threads_take(enum GizmoHostThreadSite site, long long count)
+{
+    const int nthreads = gizmo_host_thread_count();
+    if(nthreads <= 1 || count <= 0) {return 0;}
+    return (count >= host_thread_resolve((int) site, nthreads)) ? 1 : 0;
+}
+
+void gizmo_gpu_offload_report(void)
+{
+    if(ThisTask != 0) {return;}
+    printf("Work moves to the device at or above these counts per MPI task (0: whenever there is any work):\n");
+    for(int site = 0; site < GPU_OFFLOAD_NUM_SITES; site++)
+    {
+        int origin = GPU_OFFLOAD_FROM_DEFAULT;
+        const int count = gpu_offload_resolve(site, &origin);
+        const GpuOffloadRule &rule = gpu_offload_rules[site];
+        char source[160];
+        if(origin == GPU_OFFLOAD_FROM_OWN_CONTROL) {snprintf(source, sizeof(source), "set by %s", rule.own_name);}
+        else
+        {
+            char ratio[24] = "";   /* how the anchor is scaled to this count */
+            if(rule.per != 1) {snprintf(ratio, sizeof(ratio), " / %d", rule.per);}
+            else if(rule.times != 1) {snprintf(ratio, sizeof(ratio), " x %d", rule.times);}
+            snprintf(source, sizeof(source), "from %s%s%s", (origin == GPU_OFFLOAD_FROM_DEFAULT) ? "default " : "", rule.anchor_name, ratio);
+        }
+        printf("   %-46s %10d   (%s)\n", rule.what, count, source);
+    }
+    printf("   %-46s %10d   (TreeUpdateHostBelowActive, independent of the anchors; below it the dynamic tree update runs on the host)\n",
+           "gravity tree update", All.TreeUpdateHostBelowActive);
+    const int nthreads = gizmo_host_thread_count();
+    printf("Host loops run on all %d OpenMP threads at or above these counts per MPI task%s:\n", nthreads, (nthreads > 1) ? "" : " (one thread: never)");
+    for(int site = 0; site < HOST_THREAD_NUM_SITES; site++)
+    {
+        const HostThreadRule &rule = host_thread_rules[site];
+        char ratio[32] = "";
+        if(rule.times != 1 && rule.per != 1) {snprintf(ratio, sizeof(ratio), " x %d / %d", rule.times, rule.per);}
+        else if(rule.per != 1) {snprintf(ratio, sizeof(ratio), " / %d", rule.per);}
+        else if(rule.times != 1) {snprintf(ratio, sizeof(ratio), " x %d", rule.times);}
+        printf("   %-46s %10lld   (from %s%s)\n", rule.what, host_thread_resolve(site, nthreads),
+               (All.HostThreadMinCount >= 0) ? "HostThreadMinCount" : "default HostThreadMinCount = max(64, 4 x threads)", ratio);
+    }
+    fflush(stdout);
+}
+
 /*! This function parses the parameterfile in a simple way.  Each paramater is
  *  defined by a keyword (`tag'), and can be either of type douple, int, or
  *  character string.  The routine makes sure that each parameter appears
@@ -1194,7 +1380,7 @@ void read_parameter_file(char *fname)
 #define REAL 1
 #define STRING 2
 #define INT 3
-#define MAXTAGS 300
+#define MAXTAGS 500
 
     FILE *fd, *fdout;
     char buf[DEFAULT_PATH_BUFFERSIZE_TOUSE], buf1[DEFAULT_PATH_BUFFERSIZE_TOUSE], buf2[DEFAULT_PATH_BUFFERSIZE_TOUSE], buf3[DEFAULT_PATH_BUFFERSIZE_TOUSE], tag[MAXTAGS][50], alternate_tag[MAXTAGS][50];
@@ -1825,8 +2011,32 @@ void read_parameter_file(char *fname)
         addr[nt] = &All.NeighborLoopModeDThresholdMax;
         id[nt++] = INT;
 
+        strcpy(tag[nt], "GPUElementOffloadMinCount");
+        addr[nt] = &All.GPUElementOffloadMinCount;
+        id[nt++] = INT;
+
+        strcpy(tag[nt], "GPUTreeOffloadMinCount");
+        addr[nt] = &All.GPUTreeOffloadMinCount;
+        id[nt++] = INT;
+
+        strcpy(tag[nt], "GPUParticleLoopOffloadMinCount");
+        addr[nt] = &All.GPUParticleLoopOffloadMinCount;
+        id[nt++] = INT;
+
+        strcpy(tag[nt], "GPUDriftOffloadMinCount");
+        addr[nt] = &All.GPUDriftOffloadMinCount;
+        id[nt++] = INT;
+
+        strcpy(tag[nt], "GPUTreeWalkOffloadMinCount");
+        addr[nt] = &All.GPUTreeWalkOffloadMinCount;
+        id[nt++] = INT;
+
         strcpy(tag[nt], "GravityHostWalkBelowActive");
         addr[nt] = &All.GravityHostWalkBelowActive;
+        id[nt++] = INT;
+
+        strcpy(tag[nt], "HostThreadMinCount");
+        addr[nt] = &All.HostThreadMinCount;
         id[nt++] = INT;
 
         strcpy(tag[nt], "TreeUpdateHostBelowActive");
@@ -2417,13 +2627,45 @@ void read_parameter_file(char *fname)
 #endif
 
 #ifdef EOS_ELASTIC
-        strcpy(tag[nt], "Tillotson_EOS_params_mu");
-        addr[nt] = &All.Tillotson_EOS_params[0][10];
+        /* the custom solid material (CompositionType 0 of a Tillotson or plain elastic build); optional, refused in init() if cells use it incomplete */
+        strcpy(tag[nt], "SolidMaterial_ShearModulus");
+        strcpy(alternate_tag[nt], "Tillotson_EOS_params_mu");
+        addr[nt] = &All.SolidMaterialCustom.ShearModulus;
         id[nt++] = REAL;
 
-        strcpy(tag[nt], "Tillotson_EOS_params_Y0");
-        addr[nt] = &All.Tillotson_EOS_params[0][11];
+        strcpy(tag[nt], "SolidMaterial_YieldStrength");
+        strcpy(alternate_tag[nt], "Tillotson_EOS_params_Y0");
+        addr[nt] = &All.SolidMaterialCustom.YieldStrength;
         id[nt++] = REAL;
+#ifdef EOS_DAMAGE_POROSITY
+        {
+            const char *names[6] = {"WeibullK", "WeibullM", "DruckerPragerMu", "InitialDistention", "CrushPressureElastic", "CrushPressureSolid"};
+            double *fields[6] = {&All.SolidMaterialCustom.WeibullK, &All.SolidMaterialCustom.WeibullM, &All.SolidMaterialCustom.DruckerPragerMu,
+                                 &All.SolidMaterialCustom.InitialDistention, &All.SolidMaterialCustom.CrushPressureElastic, &All.SolidMaterialCustom.CrushPressureSolid};
+            for(int k_f = 0; k_f < 6; k_f++) {snprintf(tag[nt], sizeof(tag[nt]), "SolidMaterial_%s", names[k_f]); addr[nt] = fields[k_f]; id[nt++] = REAL;}
+            strcpy(tag[nt], "SolidMaterial_FractureActivation"); addr[nt] = &All.SolidMaterialCustom.FractureActivation; id[nt++] = REAL;
+#if (NUMDIMS < 3)
+            strcpy(tag[nt], "FractureOutOfPlaneExtent"); addr[nt] = &All.FractureOutOfPlaneExtent; id[nt++] = REAL;
+#endif
+            for(int k_p = 1; k_p < N_TILLOTSON_MATERIALS; k_p++) {snprintf(tag[nt], sizeof(tag[nt]), "SolidMaterialPreset%d_FractureActivation", k_p); addr[nt] = &All.SolidMaterialPresetFractureActivation[k_p]; id[nt++] = REAL;}
+        }
+#endif
+#ifdef EOS_ANEOS
+        /* per ANEOS table: the solid material it names (preset 1-6, or 0 = its own values below) */
+        for(int aneos_k = 0; aneos_k < ANEOS_MAX_MATERIALS; aneos_k++) {
+            struct solid_material *custom = &All.AneosSolidMaterialCustom[aneos_k];
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_SolidMaterial", aneos_k); addr[nt] = &All.AneosSolidMaterialChoice[aneos_k]; id[nt++] = INT;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_ShearModulus", aneos_k); addr[nt] = &custom->ShearModulus; id[nt++] = REAL;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_YieldStrength", aneos_k); addr[nt] = &custom->YieldStrength; id[nt++] = REAL;
+#ifdef EOS_DAMAGE_POROSITY
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_WeibullK", aneos_k); addr[nt] = &custom->WeibullK; id[nt++] = REAL;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_WeibullM", aneos_k); addr[nt] = &custom->WeibullM; id[nt++] = REAL;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_DruckerPragerMu", aneos_k); addr[nt] = &custom->DruckerPragerMu; id[nt++] = REAL;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_ReferenceDensity", aneos_k); addr[nt] = &custom->ReferenceDensity; id[nt++] = REAL;
+            snprintf(tag[nt], sizeof(tag[nt]), "AneosTable%d_FractureActivation", aneos_k); addr[nt] = &custom->FractureActivation; id[nt++] = REAL;
+#endif
+        }
+#endif
 #endif
 
 #if defined(RT_CHEM_PHOTOION) && !(defined(GALSF_FB_FIRE_RT_HIIHEATING) || defined(GALSF))
@@ -2843,7 +3085,10 @@ void read_parameter_file(char *fname)
                 if(strcmp("NeighborLoopModeBThresholdMax",tag[i])==0) {*((int *)addr[i])=-1; continue;} /* unset -> each loop's built-in default */
                 if(strcmp("NeighborLoopModeDThresholdSum",tag[i])==0) {*((int *)addr[i])=-1; continue;} /* unset -> 0: Mode D wherever Mode B is not chosen */
                 if(strcmp("NeighborLoopModeDThresholdMax",tag[i])==0) {*((int *)addr[i])=-1; continue;}
-                if(strcmp("GravityHostWalkBelowActive",tag[i])==0) {*((int *)addr[i])=1000; printf("Tag %s (%s) not set in parameter file: defaulting to run the gravity walk on the host below %d RANK-LOCAL active candidates per step (0 would disable this and always use the device path). \n",tag[i],alternate_tag[i],All.GravityHostWalkBelowActive); continue;}
+                if(strcmp("GPUElementOffloadMinCount",tag[i])==0 || strcmp("GPUTreeOffloadMinCount",tag[i])==0 || strcmp("GPUParticleLoopOffloadMinCount",tag[i])==0 ||
+                   strcmp("GPUDriftOffloadMinCount",tag[i])==0 || strcmp("GPUTreeWalkOffloadMinCount",tag[i])==0 || strcmp("GravityHostWalkBelowActive",tag[i])==0 ||
+                   strcmp("HostThreadMinCount",tag[i])==0)
+                    {*((int *)addr[i])=-1; continue;} /* unset -> the count the anchor gives it; the startup report lists every resolved count */
                 if(strcmp("TreeUpdateFullSweep_ActiveFraction",tag[i])==0) {*((double *)addr[i])=2; printf("Tag %s (%s) not set in parameter file: defaulting to %g -- the device tree update drifts every node of the tree unless the rank-local fraction of elements it updates is below this, in which case it brings current only the nodes the update touches. \n",tag[i],alternate_tag[i],All.TreeUpdateFullSweep_ActiveFraction); continue;}
                 if(strcmp("TreeUpdateHostBelowActive",tag[i])==0) {*((int *)addr[i])=1000; printf("Tag %s (%s) not set in parameter file: defaulting to run the dynamic tree update on the host below %d RANK-LOCAL elements due a force update per step (0 would disable this and use the device path whenever it is allowed). \n",tag[i],alternate_tag[i],All.TreeUpdateHostBelowActive); continue;}
 #ifdef AGS_KERNELRADIUS_CALCULATION_IS_ACTIVE
@@ -3049,7 +3294,14 @@ void read_parameter_file(char *fname)
 #endif
 #endif
 #ifdef EOS_ANEOS
-                if(strncmp(tag[i], "AneosTable", 10)==0) {strcpy((char *)addr[i], "none"); continue;} /* unused ANEOS table slots default to 'none' */
+                if(strncmp(tag[i], "AneosTable", 10)==0) { /* unused ANEOS table slots default to 'none'; their per-table solid material to 'not given' */
+                    if(id[i] == STRING) {strcpy((char *)addr[i], "none");} else if(id[i] == INT) {*((int *)addr[i]) = -1;} else {*((double *)addr[i]) = NAN;}
+                    continue;}
+#endif
+#ifdef EOS_ELASTIC
+                if(strncmp(tag[i], "SolidMaterial_", 14)==0) {*((double *)addr[i]) = NAN; continue;} /* not given: refused in init() only if cells carry the custom material */
+                if(strncmp(tag[i], "SolidMaterialPreset", 19)==0) {*((double *)addr[i]) = NAN; continue;} /* not given: the preset keeps the default law */
+                if(strcmp(tag[i], "FractureOutOfPlaneExtent")==0) {*((double *)addr[i]) = NAN; continue;} /* not given: refused in init() only if a 1D/2D material uses tensile flaws */
 #endif
 #ifdef DM_HEATING
                 if(strcmp("DM_AnnihilationSigmaV_over_mChi",tag[i])==0) {*((double *)addr[i])=0; printf("Tag %s (%s) not set in parameter file: defaulting to 0 (annihilation channel disabled) \n",tag[i],alternate_tag[i]); continue;}
@@ -3269,12 +3521,17 @@ void read_parameter_file(char *fname)
     }
     if(All.NeighborLoopModeDThresholdSum < -1 || All.NeighborLoopModeDThresholdMax < -1)
     {
-        if(ThisTask==0) {printf("NeighborLoopModeDThresholdSum and NeighborLoopModeDThresholdMax must be >= -1 (-1 = unset, 0 = Mode D wherever Mode B is not chosen, positive = lower bound on the summed / per-rank-max active count)\n");} endrun(1);
+        if(ThisTask==0) {printf("NeighborLoopModeDThresholdSum and NeighborLoopModeDThresholdMax must be >= -1 (-1 = unset, 0 = no bound beyond the fewest actives one device batch holds, positive = lower bound on the summed / per-rank-max active count)\n");} endrun(1);
     }
     gizmo_nlr_report_dispatch_thresholds();
-    if(All.GravityHostWalkBelowActive < 0)
+    if(All.GPUElementOffloadMinCount < -1 || All.GPUTreeOffloadMinCount < -1 || All.GPUParticleLoopOffloadMinCount < -1 ||
+       All.GPUDriftOffloadMinCount < -1 || All.GPUTreeWalkOffloadMinCount < -1 || All.GravityHostWalkBelowActive < -1)
     {
-        if(ThisTask==0) {printf("GravityHostWalkBelowActive must be >= 0 (0 = no count-based host routing, positive = rank-local active-candidate count below which the host walk is used)\n");} endrun(1);
+        if(ThisTask==0) {printf("GPUElementOffloadMinCount, GPUTreeOffloadMinCount, GPUParticleLoopOffloadMinCount, GPUDriftOffloadMinCount, GPUTreeWalkOffloadMinCount and GravityHostWalkBelowActive must be >= -1 (-1 = unset, 0 = the device whenever there is any work, positive = the rank-local count from which the work moves to the device)\n");} endrun(1);
+    }
+    if(All.HostThreadMinCount < -1)
+    {
+        if(ThisTask==0) {printf("HostThreadMinCount must be >= -1 (-1 = unset, 0 = host loops threaded whenever there is any work, positive = the rank-local count from which they run on all OpenMP threads)\n");} endrun(1);
     }
     if(All.TreeUpdateFullSweep_ActiveFraction < 0)
     {
@@ -3284,6 +3541,7 @@ void read_parameter_file(char *fname)
     {
         if(ThisTask==0) {printf("TreeUpdateHostBelowActive must be >= 0 (0 = no count-based host routing, positive = rank-local force-update count below which the host tree update is used)\n");} endrun(1);
     }
+    gizmo_gpu_offload_report();
     if((All.ErrTolForceAcc<=0)||(All.ErrTolForceAcc>=0.01))
     {
         if(ThisTask==0) {printf("ErrTolForceAcc must be >0 and <0.01 to ensure stability \n");} endrun(1);
@@ -3510,6 +3768,7 @@ void readjust_timebase(double TimeMax_old, double TimeMax_new)
 #endif
 #ifdef TURB_DRIVING
       StTPrev /= 2;
+      StTUpdatedAt /= 2;
 #endif
 
     for(i = 0; i < NumPart; i++)

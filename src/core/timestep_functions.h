@@ -427,8 +427,10 @@ int eligible_for_hermite(int i, struct particle_data *pp)
 #if defined(GRAIN_FLUID)
     if((1 << pp[i].Type) & (GRAIN_PTYPES)) {return 0;} // not compatible with these flags for these types
 #endif
+#if defined(GALSF) /* the formation time only exists, and new particles are only spawned, with GALSF */
+    if(pp[i].StellarAge >=DMAX(All.Time - 2*(get_particle_timestep_in_physical(i, pp)*All.cf_hubble_a), 0)) {return 0;} // if we were literally born yesterday then let things settle down a bit with the less-accurate, but more-robust regular integration
+#endif
 #if defined(SINK_PARTICLES) || defined(GALSF)
-    if(pp[i].StellarAge >= DMAX(All.Time - 2*(get_particle_timestep_in_physical(i, pp)*All.cf_hubble_a), 0)) {return 0;} // if we were literally born yesterday then let things settle down a bit with the less-accurate, but more-robust regular integration
     if(pp[i].AccretedThisTimestep) {return 0;}
 #endif
 #if (SINGLE_STAR_TIMESTEPPING > 0)
@@ -830,7 +832,7 @@ struct particle_motion_in_arrays {
     KOKKOS_INLINE_FUNCTION void add_reflected_momentum(int j, double mass_for_dp, double vel_before) const {pp[i].dp[j]+=(pp[i].Vel[j]-vel_before)*mass_for_dp;}
     KOKKOS_INLINE_FUNCTION void zero_momentum() const {pp[i].dp[0]=pp[i].dp[1]=pp[i].dp[2]=0;}
     KOKKOS_INLINE_FUNCTION void outflow_removed_mass() const {if(pp[i].Type==0) {cell[i].Mass=0;}}
-    /* A gas cell's radiation and cosmic-ray fluxes are mirrored with it: their normal components change sign. */
+    /* A gas cell's radiation and cosmic-ray fluxes, and its evolved non-ideal MHD field, are mirrored with it: their normal components change sign. */
     KOKKOS_INLINE_FUNCTION void reflect_normal_fluxes(int j) const
     {
         (void)j;
@@ -839,6 +841,9 @@ struct particle_motion_in_arrays {
 #endif
 #ifdef COSMIC_RAY_FLUID
         if(pp[i].Type==0) {int kf; for(kf=0;kf<N_CR_PARTICLE_BINS;kf++) {cell[i].CosmicRayFlux[kf][j]=-cell[i].CosmicRayFlux[kf][j]; cell[i].CosmicRayFluxPred[kf][j]=cell[i].CosmicRayFlux[kf][j];}}
+#endif
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+        if(pp[i].Type==0) {cell[i].NonIdealMHDFlux[j]=-cell[i].NonIdealMHDFlux[j]; cell[i].NonIdealMHDFluxPred[j]=cell[i].NonIdealMHDFlux[j];}
 #endif
     }
 };
@@ -1027,7 +1032,7 @@ void apply_special_boundary_conditions_body(Motion &a, double mass_for_dp, int m
             if((reflect_lower && x < wall_gap) || (reflect_upper && L - x < wall_gap))
             {
                 const struct particle_data &s = a.stored();
-                const uint64_t key = gizmo_gpu_splitmix64((uint64_t) s.ID ^ gizmo_gpu_splitmix64((uint64_t) s.ID_child_number ^ gizmo_gpu_splitmix64((uint64_t) s.ID_generation)));
+                const uint64_t key = gizmo_rng_particle_identity((uint64_t) s.ID, (uint64_t) s.ID_child_number, (uint64_t) s.ID_generation);
                 const int face = (reflect_lower && x < wall_gap) ? 0 : 1;
                 const uint64_t counter = gizmo_gpu_splitmix64(((uint64_t) ti_target) ^ SPECIAL_BOUNDARY_RNG_SALT) + (uint64_t)(6 * crossings + 2 * j + face);
                 const double offset = wall_gap * (0.5 + gizmo_gpu_rand_double(key, counter));
