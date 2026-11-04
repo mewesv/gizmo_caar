@@ -35,6 +35,9 @@
 #ifdef EOS_ELASTIC
 #include "../solids/elastic_physics_functions.h"
 #endif
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+#include "../hydro/nonideal_mhd_functions.h"
+#endif
 
 
 KOKKOS_INLINE_FUNCTION
@@ -63,6 +66,9 @@ void drift_extra_physics_P(int i, integertime tstart, integertime tend, double d
 #endif
 #ifdef COSMIC_RAY_FLUID
     CosmicRay_Update_DriftKick(i, dt_entr, 1, pp, cell);
+#endif
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+    nonideal_mhd_flux_update_driftkick(i, dt_entr, 1, pp, cell);
 #endif
 #ifdef RADTRANSFER
     rt_update_driftkick(i, dt_entr, 1, pp, cell);
@@ -166,20 +172,28 @@ void drift_particle_impl(int i, integertime time1, struct particle_data *pp,
             pp[i].Mass = mfv_drifted_mass(pp[i].Mass, cell[i].DtMass, cell[i].MassTrue, dt_entr); cell[i].Mass = pp[i].Mass;
 #endif
             
-            cell[i].Density *= exp(-divv_fac);
+            double divv_fac_density = divv_fac; /* the predicted density follows the volume's divergence */
+#ifdef SOLID_VOLUME_FROM_SOLID_NEIGHBOURS
+            if(cell[i].SolidBesideGas) {divv_fac_density = kernel_radius_drift_log_change(cell[i].SolidVelocityDivergence * dt_drift);} /* a solid beside gas: its own material's (kicks.cc) */
+#endif
+            cell[i].Density *= exp(-divv_fac_density);
             double etmp = cell[i].InternalEnergyPred + cell[i].DtInternalEnergy * dt_entr;
+            double u_floor = 0; /* the lowest energy the material's equation of state is valid at (0: none), at the predicted density */
+#ifdef EOS_ANEOS
+            u_floor = lowest_valid_internal_energy(eos_tables ? eos_tables->aneos : NULL, cell[i].CompositionType, cell[i].Density);
+#endif
 #if defined(RADTRANSFER) && defined(RT_EVOLVE_ENERGY) /* block here to deal with tricky cases where radiation energy density is -much- larger than thermal */ 
             int kfreq; double erad_tot=0,tot_e_min=0,enew=0,int_e_min=0,dErad=0,rsol_fac=C_LIGHT_CODE_REDUCED/C_LIGHT_CODE; for(kfreq=0;kfreq<N_RT_FREQ_BINS;kfreq++) {erad_tot+=cell[i].Rad_E_gamma_Pred[kfreq];}
             if(erad_tot > 0)
             {
-                int_e_min=0.025*cell[i].InternalEnergyPred; tot_e_min=0.025*(erad_tot/rsol_fac+cell[i].InternalEnergyPred*pp[i].Mass);
+                int_e_min=DMAX(0.025*cell[i].InternalEnergyPred, u_floor); tot_e_min=0.025*(erad_tot/rsol_fac+cell[i].InternalEnergyPred*pp[i].Mass);
                 enew=DMAX(erad_tot/rsol_fac+etmp*pp[i].Mass,tot_e_min); etmp=(enew-erad_tot/rsol_fac)/pp[i].Mass; if(etmp<int_e_min) {dErad=rsol_fac*(etmp-int_e_min); etmp=int_e_min;}
                 if(dErad<-0.975*erad_tot) {dErad=-0.975*erad_tot;} cell[i].InternalEnergyPred = etmp; for(kfreq=0;kfreq<N_RT_FREQ_BINS;kfreq++) {cell[i].Rad_E_gamma_Pred[kfreq] *= 1 + dErad/erad_tot;}
             } else {
-                if(etmp<0.5*cell[i].InternalEnergyPred) {cell[i].InternalEnergyPred *= 0.5;} else {cell[i].InternalEnergyPred=etmp;}
+                cell[i].InternalEnergyPred = internal_energy_positivity_catch(cell[i].InternalEnergyPred, etmp, u_floor);
             }
 #else
-            if(etmp<0.5*cell[i].InternalEnergyPred) {cell[i].InternalEnergyPred *= 0.5;} else {cell[i].InternalEnergyPred=etmp;}
+            cell[i].InternalEnergyPred = internal_energy_positivity_catch(cell[i].InternalEnergyPred, etmp, u_floor);
 #endif
             if(cell[i].InternalEnergyPred<All.MinEgySpec) cell[i].InternalEnergyPred=All.MinEgySpec;
             

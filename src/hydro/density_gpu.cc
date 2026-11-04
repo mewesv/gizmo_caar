@@ -236,6 +236,9 @@ void hydro_evaluate_gpu(struct particle_data *P_host, struct gas_cell_data *Cell
             local.SoundSpeed = kc[ii].effective_soundspeed();
             local.dt_hydrostep_i = get_particle_timestep_in_physical(ii, kp);
             local.DrkernNgbFactor = kp[ii].DrkernNgbFactor;
+#ifdef EOS_ANEOS
+            local.Temperature = kc[ii].Temperature;
+#endif
             local.Gradients.Density = kc[ii].Gradients.Density;
             local.Gradients.Pressure = kc[ii].Gradients.Pressure;
             local.Gradients.Velocity = kc[ii].Gradients.Velocity;
@@ -300,6 +303,9 @@ void hydro_evaluate_gpu(struct particle_data *P_host, struct gas_cell_data *Cell
             local.Eta_MHD_OhmicResistivity_Coeff = kc[ii].Eta_MHD_OhmicResistivity_Coeff;
             local.Eta_MHD_HallEffect_Coeff = kc[ii].Eta_MHD_HallEffect_Coeff;
             local.Eta_MHD_AmbiPolarDiffusion_Coeff = kc[ii].Eta_MHD_AmbiPolarDiffusion_Coeff;
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+            local.NonIdealMHDFlux = kc[ii].NonIdealMHDFluxPred;
+#endif
 #endif
 #if defined(SPH_TP12_ARTIFICIAL_RESISTIVITY)
             local.Balpha = kc[ii].Balpha;
@@ -314,7 +320,7 @@ void hydro_evaluate_gpu(struct particle_data *P_host, struct gas_cell_data *Cell
             for(int ki=0;ki<ismdc_n;ki++) {local.Metallicity[ISMDUSTCHEM_SPECIES_OFFSET_IN_METALLICITY+ki] = ismdc[aa*ismdc_n+ki];}
 #endif
 #ifdef CHIMES_TURB_DIFF_IONS
-            for(int k=0;k<ChimesGlobalVars.totalNumberOfSpecies;k++) {local.ChimesNIons[k] = kc[ii].ChimesNIons[k];}
+            for(int k=0;k<All.ChimesNumSpecies;k++) {local.ChimesNIons[k] = kc[ii].ChimesNIons[k];}
 #endif
 #if defined(RT_SOLVER_EXPLICIT) && defined(RT_COMPGRAD_EDDINGTON_TENSOR) && (N_RT_FREQ_BINS > 0)
             for(int k=0;k<N_RT_FREQ_BINS;k++) {local.Gradients.Rad_E_gamma_ET[k] = kc[ii].Gradients.Rad_E_gamma_ET[k];}
@@ -362,6 +368,7 @@ void hydro_evaluate_gpu(struct particle_data *P_host, struct gas_cell_data *Cell
 #endif
 #ifdef EOS_ELASTIC
             for(int k=0;k<3;k++) {for(int k2=0;k2<3;k2++) {local.Elastic_Stress_Tensor[k][k2] = kc[ii].Elastic_Stress_Tensor_Pred[k][k2];}}
+            local.RecentYieldMemory = kc[ii].RecentYieldMemory;
 #endif
 #if defined(EOS_DAMAGE_POROSITY) && ((EOS_DAMAGE_POROSITY) & 1)
             local.Damage = kc[ii].Damage;

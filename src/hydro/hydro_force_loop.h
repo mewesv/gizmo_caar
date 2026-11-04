@@ -133,6 +133,7 @@ struct HydroForceDeviceContext : NeighborLoopDeviceContextBase
 struct HydroForceSpec
 {
     static constexpr const char *loop_name = "hydro_force";
+    static constexpr bool writeback_writes_only_own_particle = true;   /* writes CellP[i] and its own accumulator only */
     /* Eval-thread tier: j-side writes are CellP[j].dMass (Kokkos::atomic_add,
      * MFV), P[j].wakeup (Kokkos::atomic_max, order-invariant), NeedToWakeup
      * (Kokkos::atomic_store 1, idempotent) — all via HYDRO_ATOMIC_* in
@@ -255,6 +256,9 @@ struct HydroForceSpec
         local.SoundSpeed          = kc[i].effective_soundspeed();
         local.dt_hydrostep_i      = get_particle_timestep_in_physical(i, kp);
         local.DrkernNgbFactor     = kp[i].DrkernNgbFactor;
+#ifdef EOS_ANEOS
+        local.Temperature         = kc[i].Temperature;
+#endif
         local.Gradients.Density   = kc[i].Gradients.Density;
         local.Gradients.Pressure  = kc[i].Gradients.Pressure;
         local.Gradients.Velocity  = kc[i].Gradients.Velocity;
@@ -321,6 +325,9 @@ struct HydroForceSpec
         local.Eta_MHD_OhmicResistivity_Coeff  = kc[i].Eta_MHD_OhmicResistivity_Coeff;
         local.Eta_MHD_HallEffect_Coeff        = kc[i].Eta_MHD_HallEffect_Coeff;
         local.Eta_MHD_AmbiPolarDiffusion_Coeff = kc[i].Eta_MHD_AmbiPolarDiffusion_Coeff;
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+        local.NonIdealMHDFlux = kc[i].NonIdealMHDFluxPred;
+#endif
 #endif
 #if defined(SPH_TP12_ARTIFICIAL_RESISTIVITY)
         local.Balpha = kc[i].Balpha;
@@ -348,7 +355,7 @@ struct HydroForceSpec
         }
 #endif
 #ifdef CHIMES_TURB_DIFF_IONS
-        for(int k = 0; k < ChimesGlobalVars.totalNumberOfSpecies; k++) { local.ChimesNIons[k] = kc[i].ChimesNIons[k]; }
+        for(int k = 0; k < All.ChimesNumSpecies; k++) { local.ChimesNIons[k] = kc[i].ChimesNIons[k]; }
 #endif
 #if defined(RT_SOLVER_EXPLICIT) && defined(RT_COMPGRAD_EDDINGTON_TENSOR) && (N_RT_FREQ_BINS > 0)
         for(int k = 0; k < N_RT_FREQ_BINS; k++) { local.Gradients.Rad_E_gamma_ET[k] = kc[i].Gradients.Rad_E_gamma_ET[k]; }
@@ -396,6 +403,7 @@ struct HydroForceSpec
 #endif
 #ifdef EOS_ELASTIC
         for(int k = 0; k < 3; k++) { for(int k2 = 0; k2 < 3; k2++) { local.Elastic_Stress_Tensor[k][k2] = kc[i].Elastic_Stress_Tensor_Pred[k][k2]; } }
+        local.RecentYieldMemory = kc[i].RecentYieldMemory;
 #endif
 #if defined(EOS_DAMAGE_POROSITY) && ((EOS_DAMAGE_POROSITY) & 1)
         local.Damage = kc[i].Damage;
@@ -508,6 +516,9 @@ struct HydroForceSpec
 #ifdef ENERGY_ENTROPY_SWITCH_IS_ACTIVE
         MERGE_MAX(MaxKineticEnergyNgb);
 #endif
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS)
+        MERGE_MAX(ElasticImpedanceNeighbour);
+#endif
 #ifdef HYDRO_MESHLESS_FINITE_VOLUME
         MERGE_ADD(DtMass);
         MERGE_ADD(dMass);
@@ -517,7 +528,7 @@ struct HydroForceSpec
         for(int k = 0; k < NUM_METAL_SPECIES; k++) { dst.Dyield[k] += src.Dyield[k]; }
 #endif
 #ifdef CHIMES_TURB_DIFF_IONS
-        for(int k = 0; k < ChimesGlobalVars.totalNumberOfSpecies; k++) { dst.ChimesIonsYield[k] += src.ChimesIonsYield[k]; }
+        for(int k = 0; k < All.ChimesNumSpecies; k++) { dst.ChimesIonsYield[k] += src.ChimesIonsYield[k]; }
 #endif
 #if defined(RT_SOLVER_EXPLICIT)
 #if defined(RT_EVOLVE_ENERGY)

@@ -126,6 +126,16 @@ int gizmo_node_headroom_admits(long long bytes_this_rank)
     return all_ok;
 }
 
+/* Whether bytes fit within fraction of this rank's device's free memory: 1 when they do, or when that
+   memory is not known (a refused allocation is then the backstop). Advisory -- ranks sharing a device
+   can allocate between this and their own use. */
+int gizmo_device_has_room(size_t bytes, double fraction)
+{
+    size_t free_bytes = 0, total_bytes = 0;
+    if(!gizmo_gpu_device_memory(&free_bytes, &total_bytes)) {return 1;}
+    return (double) bytes <= fraction * (double) free_bytes;
+}
+
 /* Per-process virtual and resident size from /proc/self/status (Linux; 0 elsewhere).
    VIRTUAL/committed (VmSize) is what mmap reserved -- the quantity strict-overcommit
    nodes (Frontera) fail on -- and can far exceed RESIDENT (VmRSS), the pages actually
@@ -348,7 +358,7 @@ static void report_memory_ledger_impl(const char *when, int always)
                 }
             n += snprintf(buf + n, (n < (int) sizeof(buf)) ? sizeof(buf) - n : 0,
                           "  kokkos %.0f cur / %.0f hw: SoA %.0f tree-AoS %.0f tree-SoA %.0f walk %.0f runner %.0f sidecar %.0f"
-                          " tscratch-b %.0f tscratch-m %.0f ngl-sidx %.0f ngl-pairs %.0f ngl-packet %.0f (peak %.0f) ngl-other %.0f"
+                          " tscratch-b %.0f tscratch-m %.0f ngl-sidx %.0f ngl-pairs %.0f ngl-packet %.0f (peak %.0f) ngl-moded %.0f (peak %.0f) ngl-other %.0f"
                           " mg-graph %.0f (peak %.0f) mg-insert %.0f (peak %.0f; HYPRE's own memory is not observed) unclass %.0f\n",
                           node_kok_cur / (1024.0 * 1024.0), node_kok_hw / (1024.0 * 1024.0),
                           bkt_mb[GIZMO_KOKBUCKET_PARTICLE_SOA], bkt_mb[GIZMO_KOKBUCKET_TREE_ARRAYS],
@@ -357,6 +367,7 @@ static void report_memory_ledger_impl(const char *when, int always)
                           bkt_mb[GIZMO_KOKBUCKET_TREESCRATCH_BUILD], bkt_mb[GIZMO_KOKBUCKET_TREESCRATCH_MOMENT],
                           bkt_mb[GIZMO_KOKBUCKET_NGL_SIDX], bkt_mb[GIZMO_KOKBUCKET_NGL_PAIRS],
                           bkt_mb[GIZMO_KOKBUCKET_NGL_PACKET], bkt_hw_mb[GIZMO_KOKBUCKET_NGL_PACKET],
+                          bkt_mb[GIZMO_KOKBUCKET_NGL_MODE_D_CALL], bkt_hw_mb[GIZMO_KOKBUCKET_NGL_MODE_D_CALL],
                           bkt_mb[GIZMO_KOKBUCKET_NGL],
                           bkt_mb[GIZMO_KOKBUCKET_MG_GRAPH], bkt_hw_mb[GIZMO_KOKBUCKET_MG_GRAPH],
                           bkt_mb[GIZMO_KOKBUCKET_MG_INSERT], bkt_hw_mb[GIZMO_KOKBUCKET_MG_INSERT],
@@ -439,6 +450,17 @@ double comm_chunk_megabytes_default(void)
     return (raised > customary_megabytes) ? raised : customary_megabytes;
 }
 
+/* The communication chunk in bytes.  CommChunkSize is a floating-point number of megabytes and is not always a whole
+   one (the default above is not), so the conversion is done in floating point; truncating it to whole megabytes first
+   turns 0.5 into 0.  Every byte conversion of the parameter goes through here. */
+size_t comm_chunk_bytes(void)
+{
+    const double bytes = All.CommChunkSize * 1024.0 * 1024.0;
+    const double largest = (double) ((size_t) 1 << 60);   /* far past any message, and leaves room to multiply */
+    if(!(bytes >= 1.0)) {return 1;}
+    return (bytes > largest) ? ((size_t) 1 << 60) : (size_t) bytes;
+}
+
 /* How big to make the memory arena when the parameter file does not say. Called once, before the
    arena is created, which is the only moment early enough: the arena is the first thing built and
    everything else is allocated out of it.
@@ -495,7 +517,7 @@ static int arena_megabytes_from_tenants(long long total_particles, const char **
        coupling between a communication setting and the run's memory footprint, and the report at
        the end of this file names whichever tenant set the figure so it is visible rather than
        surprising. */
-    long long step = (long long) All.CommChunkSize * 1024 * 1024
+    long long step = (long long) comm_chunk_bytes()
                    + (long long) GRAVITY_LET_DETECTOR_ENTRIES
                      * (long long) (sizeof(struct data_index) + sizeof(struct data_nodelist))
                    + maxpart * (long long) (2 * sizeof(MyFloat));
@@ -758,7 +780,7 @@ int gizmo_memory_preflight(void)
             if(share > particles_per_rank + tree_per_rank && nopt < maxopt)
             {
                 long long fits_mb = (share - particles_per_rank - tree_per_rank) / (1024 * 1024);
-                if(fits_mb > (long long) All.CommChunkSize && fits_mb < All.WorkingMemoryPoolSize)
+                if((double) fits_mb > All.CommChunkSize && fits_mb < All.WorkingMemoryPoolSize)
                     {snprintf(optbuf[nopt], sizeof(optbuf[0]), "WorkingMemoryPoolSize %lld", fits_mb); nopt++;}
             }
             for(int k = 0; k < nopt; k++)

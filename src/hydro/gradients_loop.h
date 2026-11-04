@@ -69,6 +69,11 @@ struct temporary_data_topass
     struct Quantities_for_Gradients Maxima;
     struct Quantities_for_Gradients Minima;
     MyFloat MaxDistance;
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+    MyDouble SolidVelocityDifferences[3][3];
+    MyDouble SolidSeparationMoments[3][3];
+    MyDouble GasNeighbours;
+#endif
 #if defined(KERNEL_CRK_FACES)
     MyDouble m0;
     MyDouble m1[3];
@@ -169,6 +174,7 @@ struct GradientsDeviceContext : NeighborLoopDeviceContextBase
 struct GradientsSpec
 {
     static constexpr const char *loop_name = "gradients";
+    static constexpr bool writeback_writes_only_own_particle = true;   /* writes its own P[i]/CellP[i] fields, passer[i] and its own accumulator only */
     static constexpr ModeBEvalOMP modeb_eval_omp = ModeBEvalOMP::BitwiseReadonly; /* i-side AccumData only (delegates to gradient_accumulate_neighbor: out-> + local kernel scratch); no j-write, no atomics -> threaded eval bit-identical */
 
     /* Symmetric gas-gas topology (matches gizmo_sym_neighbor_list + the
@@ -348,6 +354,9 @@ struct GradientsSpec
         local.DelayTime = kc[i].DelayTime;
 #endif
 #endif
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+        local.CompositionType = kc[i].CompositionType;
+#endif
 #ifdef MHD_CONSTRAINED_GRADIENT
         local.ConditionNumber = kc[i].ConditionNumber;
         local.NV_T            = kc[i].NV_T;
@@ -440,6 +449,10 @@ struct GradientsSpec
 #define MERGE_MAX(field)  do { if(src.field > dst.field) dst.field = src.field; } while(0)
 #define MERGE_MIN(field)  do { if(src.field < dst.field) dst.field = src.field; } while(0)
 
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+        for(int k = 0; k < 3; k++) { for(int k2 = 0; k2 < 3; k2++) { MERGE_ADD(SolidVelocityDifferences[k][k2]); MERGE_ADD(SolidSeparationMoments[k][k2]); } }
+        MERGE_ADD(GasNeighbours);
+#endif
         /* Gradients[k].* — additive for every quantity in Quantities_for_Gradients. */
         for(int k = 0; k < 3; k++) {
             MERGE_ADD(Gradients[k].Density);
@@ -590,6 +603,7 @@ struct GradientsSpec
 struct GradientsIterSpec
 {
     static constexpr const char *loop_name = "gradients";
+    static constexpr bool writeback_writes_only_own_particle = true;   /* writes passer[i] only */
     static constexpr ModeBEvalOMP modeb_eval_omp = ModeBEvalOMP::BitwiseReadonly; /* i-side AccumData only; no j-write, no atomics */
 
     static constexpr int                     search_mode        = MODE_B_SEARCH_SYMMETRIC;

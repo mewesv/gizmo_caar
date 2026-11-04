@@ -34,6 +34,7 @@
 #include "../declarations/gpu_all_mirror.h"  /* MUST precede allvars.h: installs device-pass `#define All AllDeviceMirror` redirect before cell_data.h is parsed */
 #include "../declarations/allvars.h"
 #include "../core/proto.h"
+#include "../system/eigen_symmetric.h"
 #include "../system/gpu_particles_arena.h"
 #include "../mesh/kernel.h"                   /* MUST precede gradients_loop.h
                                                 * — kernel.h has no include guards */
@@ -93,6 +94,29 @@ void local_slopelimiter(double *grad, double valmax, double valmin, double alim,
         if(cfac < 1) { g *= cfac; }
     }
 }
+
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+/* Velocity gradient of a solid from its solid neighbours only: the least-squares fit (the same pair weights as the ordinary gradient)
+ * with a regularised inverse of the separation moments, 1/lambda -> lambda/(lambda^2 + (0.01 lambda_max)^2): a direction keeps
+ * 1/(1 + (0.01 lambda_max/lambda)^2) of its least-squares weight, so one sampled below ~0.01 lambda_max fades out (a plain inverse would
+ * amplify its noise without bound; the weight peaks at 50/lambda_max there): a lone solid cell gets no gradient, a one-cell-thick
+ * sheet only its in-plane part. */
+static void solid_neighbour_velocity_gradient(const struct temporary_data_topass &pass, double velocity_gradient[3][3])
+{
+    double moments[NUMDIMS*NUMDIMS], eigenvalues[NUMDIMS], eigenvectors[NUMDIMS*NUMDIMS], inverse[3][3] = {{0}}, largest = 0;
+    for(int a = 0; a < NUMDIMS; a++) { for(int b = 0; b < NUMDIMS; b++) { moments[NUMDIMS*a + b] = pass.SolidSeparationMoments[a][b]; } }
+    eigen_symmetric(moments, eigenvalues, eigenvectors, NUMDIMS);
+    for(int e = 0; e < NUMDIMS; e++) { largest = DMAX(largest, fabs(eigenvalues[e])); }
+    for(int e = 0; e < NUMDIMS; e++) {
+        double floor2 = 1.e-4 * largest*largest, weight = (eigenvalues[e] > 0) ? eigenvalues[e] / (eigenvalues[e]*eigenvalues[e] + floor2) : 0;
+        for(int a = 0; a < NUMDIMS; a++) { for(int b = 0; b < NUMDIMS; b++) { inverse[a][b] += eigenvectors[NUMDIMS*e + a] * eigenvectors[NUMDIMS*e + b] * weight; } }
+    }
+    for(int j = 0; j < 3; j++) { for(int k = 0; k < 3; k++) {
+        velocity_gradient[j][k] = 0;
+        for(int l = 0; l < NUMDIMS; l++) { velocity_gradient[j][k] += pass.SolidVelocityDifferences[j][l] * inverse[l][k]; }
+    }}
+}
+#endif
 
 void construct_gradient(Vec3<MyDouble>& grad, int i)
 {
@@ -191,6 +215,10 @@ void GradientsSpec::apply_active_writeback(const neighbor_loop_args& args,
     {
         int j, k;
         MAX_ADD(passer[i].MaxDistance, out->MaxDistance, 0);
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+        for(j = 0; j < 3; j++) { for(k = 0; k < 3; k++) { passer[i].SolidVelocityDifferences[j][k] += out->SolidVelocityDifferences[j][k]; passer[i].SolidSeparationMoments[j][k] += out->SolidSeparationMoments[j][k]; } }
+        passer[i].GasNeighbours += out->GasNeighbours;
+#endif
 #ifdef TURB_DIFF_DYNAMIC
         for(j = 0; j < 3; j++) {
             MAX_ADD(passer[i].Maxima.Velocity_bar[j], out->Maxima.Velocity_bar[j], 0);
@@ -415,6 +443,9 @@ void hydro_gradient_calc(void)
     GIZMO_TIMER_FUNCTION();
     CPU_Step[CPU_DENSMISC] += measure_time();
     double t0 = my_second();
+    /* The per-active host loops below each write only their own particle, so they thread over the
+     * active list on any step with enough actives to pay for it. */
+    const int n_active_list = (int) ActiveParticleList.size();
 
 #ifdef TURB_DIFF_DYNAMIC
     /* (0) Velocity_bar takes its smoothing once, on its owner, before anything
@@ -422,7 +453,11 @@ void hydro_gradient_calc(void)
      * neighbour's Velocity_bar against the particle's own, so the ghost refresh
      * below must ship the scaled value. Done in either corridor mode, never
      * inside the refresh (whose fallback can rebuild and repeat). */
-    for(int i : ActiveParticleList) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(gizmo_host_threads_take(HOST_THREAD_PARTICLE_LOOP, n_active_list))
+#endif
+    for(int idx = 0; idx < n_active_list; idx++) {
+        const int i = ActiveParticleList[idx];
         if(P[i].Type == 0) {CellP[i].Velocity_bar *= All.TurbDynamicDiffSmoothing;}
     }
 #endif
@@ -442,7 +477,7 @@ void hydro_gradient_calc(void)
     if(corridor_built_csr) {
         gizmo_hydro_corridor_refresh_ghost_values("pre_gradients");
     } else if(corridor_mode == GizmoHydroCorridorMode::MODE_A
-              && gizmo_sym_num_active_global > 0) {
+              && gizmo_sym_any_active_global) {
         printf("FATAL: hydro_gradient_calc in Mode A with active gas but no published corridor CSR on task %d.\n", ThisTask);
         fflush(stdout);
         endrun(7315);
@@ -467,7 +502,11 @@ void hydro_gradient_calc(void)
 #ifdef TURB_DIFF_DYNAMIC
     double smoothInv = 1.0 / All.TurbDynamicDiffSmoothing;
 #endif
-    for(int i : ActiveParticleList) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(gizmo_host_threads_take(HOST_THREAD_PARTICLE_LOOP, n_active_list))
+#endif
+    for(int idx = 0; idx < n_active_list; idx++) {
+        const int i = ActiveParticleList[idx];
         if(P[i].Type != 0) continue;
         int k2;
         memset(&passer_base[i], 0, sizeof(struct temporary_data_topass));
@@ -551,14 +590,18 @@ void hydro_gradient_calc(void)
      * blocking the between-iter corridor refresh from freeing
      * sym_neighbor_list — abort 814. */
     const bool nothing_to_do =
-        (!corridor_built_csr) && (gizmo_sym_num_active_global <= 0);
+        (!corridor_built_csr) && (!gizmo_sym_any_active_global);
 
     for(int grad_iter = 0; (!nothing_to_do) && grad_iter < NUMBER_OF_GRADIENT_ITERATIONS; grad_iter++) {
         aux.grad_iter = grad_iter;
 
         /* (5a) Zero per-iter passer fields (mirrors gradients.cc:637-646). */
         if(grad_iter > 0) {
-            for(int i : ActiveParticleList) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(gizmo_host_threads_take(HOST_THREAD_PARTICLE_LOOP, n_active_list))
+#endif
+            for(int idx = 0; idx < n_active_list; idx++) {
+                const int i = ActiveParticleList[idx];
                 if(P[i].Type != 0) continue;
 #ifdef MHD_CONSTRAINED_GRADIENT
                 passer_base[i].FaceDotB = 0;
@@ -610,7 +653,11 @@ void hydro_gradient_calc(void)
         /* (5d) Host between-iter MHD-CG block — verbatim from
          * hydro/gradients.cc:689-829. */
 #ifdef MHD_CONSTRAINED_GRADIENT
-        for(int i : ActiveParticleList) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 64) if(gizmo_host_threads_take(HOST_THREAD_PARTICLE_LOOP, n_active_list))
+#endif
+        for(int idx = 0; idx < n_active_list; idx++) {
+            const int i = ActiveParticleList[idx];
             if(P[i].Type != 0) continue;
             int k, k1;
             CellP[i].FlagForConstrainedGradients = 1;
@@ -639,7 +686,7 @@ void hydro_gradient_calc(void)
                         dbgrad += 2. * dh * fabs(b0 * CellP[i].Gradients.B[k][k1]);
                     }
                 }
-                dbmax /= dbgrad;
+                dbmax = (dbgrad > 0) ? dbmax / dbgrad : MAX_REAL_NUMBER; /* no field-gradient term (e.g. B=0): only the ordinary slope limit below applies */
                 for(k1 = 0; k1 < 3; k1++) {
                     double d_abs = CellP[i].Gradients.B[k1].norm_sq();
                     if(d_abs > 0) {
@@ -841,9 +888,13 @@ void hydro_gradient_calc(void)
 #if defined(ADAPTIVE_GRAVSOFT_FORGAS) || (ADAPTIVE_GRAVSOFT_FORALL & 1)
         {
             double ngb_eff = pow(P[i].NumNgb, NUMDIMS);
+            int softening_is_free = (P[i].KernelRadius > All.ForceSoftening[0]); /* at the softening floor the radius does not vary with the density */
+#if defined(ADAPTIVE_GRAVSOFT_FORGAS) && defined(ADAPTIVE_GRAVSOFT_MAX_SOFT_HARD_LIMIT)
+            if(P[i].KernelRadius >= ADAPTIVE_GRAVSOFT_MAX_SOFT_HARD_LIMIT/All.cf_atime) {softening_is_free = 0;} /* nor at the hard upper limit */
+#endif
             if((fabs(ngb_eff - All.DesNumNgb) / All.DesNumNgb < 0.05)
                && (P[i].KernelRadius > 1.001 * All.MinKernelRadius)
-               && (P[i].KernelRadius < 0.999 * All.MaxKernelRadius)) {
+               && (P[i].KernelRadius < 0.999 * All.MaxKernelRadius) && softening_is_free) {
                 double ndenNGB = ngb_eff / (VOLUME_NORM_COEFF_FOR_NDIMS * pow(P[i].KernelRadius, NUMDIMS));
                 P[i].AGS_zeta *= P[i].Mass * P[i].KernelRadius / (NUMDIMS * ndenNGB) * P[i].DrkernNgbFactor;
             } else {
@@ -965,7 +1016,24 @@ void hydro_gradient_calc(void)
         }
 #endif /* RADTRANSFER */
 
-#if defined(EOS_ELASTIC)
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+        /* a solid beside gas deforms with its own material, not with the gas flowing past it: its stress rate and the velocity
+           divergence that evolves its volume use the velocity gradient of its solid neighbours (the hydro gradient, for its
+           reconstruction, and the kernel divergence, for its kernel radius, keep every neighbour) */
+        CellP[i].SolidBesideGas = (solid_material_is_elastic(CellP[i].CompositionType) && passer_base[i].GasNeighbours > 0);
+        if(CellP[i].SolidBesideGas) {
+            double velocity_gradient[3][3], divergence = 0;
+            solid_neighbour_velocity_gradient(passer_base[i], velocity_gradient);
+            for(k = 0; k < NUMDIMS; k++) { divergence += velocity_gradient[k][k]; }
+            CellP[i].SolidVelocityDivergence = divergence;
+#ifdef EOS_ELASTIC
+            elastic_stress_rate(i, velocity_gradient);
+#endif
+        }
+#ifdef EOS_ELASTIC
+        else {elastic_body_update_driftkick(i, 1., 2);}
+#endif
+#elif defined(EOS_ELASTIC)
         elastic_body_update_driftkick(i, 1., 2);
 #endif
 

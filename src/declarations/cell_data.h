@@ -23,7 +23,7 @@ extern struct gas_cell_data
     MyDouble MassTrue;              /*!< true particle mass ('mass' now is -predicted- mass */
     MyDouble dMass;                 /*!< change in particle masses from hydro step (conserved variable) */
     MyDouble DtMass;                /*!< rate-of-change of particle masses (for drifting) */
-    Vec3<MyDouble> GravWorkTerm;    /*!< correction term needed for hydro mass flux in gravity */
+    Vec3<MyDouble> GravWorkTerm;    /*!< MFV: sum over faces of the transferred mass flux times the pair separation, per unit cell mass; dot with the gravitational acceleration gives the specific heating rate that repays the potential energy of the exchanged mass */
     Vec3<MyDouble> ParticleVel;     /*!< actual velocity of the mesh-generating points */
 #endif
     
@@ -40,6 +40,7 @@ extern struct gas_cell_data
 
 #ifdef HYDRO_EXPLICITLY_INTEGRATE_VOLUME
     MyDouble Density_ExplicitInt;   /*!< explicitly integrated volume/density variable to be used if integrating the SPH-like form of the continuity directly */
+    MyDouble KernelDensityForVolumeRelaxation; /*!< kernel (surface-corrected, if enabled) density from the last density pass: the value Density_ExplicitInt relaxes toward */
 #endif
     
 #ifdef HYDRO_VOLUME_CORRECTIONS
@@ -185,6 +186,13 @@ extern struct gas_cell_data
 #ifdef ENERGY_ENTROPY_SWITCH_IS_ACTIVE
     MyDouble MaxKineticEnergyNgb;   /*!< maximum kinetic energy (with respect to neighbors): use for entropy 'switch' */
 #endif
+#ifdef SOLID_OWN_VELOCITY_GRADIENT
+    signed char SolidBesideGas;      /*!< 1 if the last gradient pass found this solid cell with gas neighbours: its volume then follows */
+    MyFloat SolidVelocityDivergence; /*!< the velocity divergence of its solid neighbours (gradients_loop.cc), not the kernel's */
+#endif
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS)
+    signed char ElasticImpedanceNeighbour; /*!< 1 if the last hydro force evaluation found a pair within the scope of the elastic face impedance dissipation (a gas cell next to a solid): its timestep is then capped like a solid's */
+#endif
     
 #if defined(TURB_DIFF_METALS) || (defined(METALS) && defined(HYDRO_MESHLESS_FINITE_VOLUME))
     MyFloat Dyield[NUM_METAL_SPECIES];
@@ -240,15 +248,16 @@ extern struct gas_cell_data
 #if !defined(COOLING_OPERATOR_SPLIT)
     int CoolingIsOperatorSplitThisTimestep; /* flag to tell us if cooling is operator split or not on a given timestep */
 #endif
-#ifndef CHIMES
     MyFloat Ne;  /*!< electron fraction, expressed as local electron number density normalized to the hydrogen number density. Gives indirectly ionization state and mean molecular weight. */
     MyFloat HI;  /*!< neutral hydrogen fraction (neutral H nuclei per H nucleus), saved by the cooling solver so other modules can read it instead of re-solving the chemistry */
+#if defined(EXTERNAL_CHEMISTRY_REPORTS_SPECIES) && !defined(RT_CHEM_PHOTOION)
+    MyFloat HII;  /*!< ionized hydrogen fraction (ionized H nuclei per H nucleus), saved by a chemistry library that tracks it as a species (with RT_CHEM_PHOTOION the radiation module declares it) */
+#endif
 #ifdef EOS_ANCHOR_INTERNALENERGY_IN_DRIFTS
     MyFloat u_anchor;  /*!< the internal energy Temperature was last computed at. The u->T read is
                             anchored: T(u) = Temperature + (Gamma-1)*mu*U_TO_TEMP*(u - u_anchor), so
                             the cached pair is exact at the anchor and tangent for the excursion since.
                             Every writer of Temperature must write this beside it. */
-#endif
 #endif
 #endif
 #ifdef GALSF
@@ -318,7 +327,7 @@ extern struct gas_cell_data
     MyFloat Kappa_Conduction;                   /*!< conduction coefficient */
 #endif
     
-#if defined(OUTPUT_MOLECULAR_FRACTION) || defined(COOL_MOLECFRAC_NONEQM)
+#if defined(OUTPUT_MOLECULAR_FRACTION) || defined(COOL_MOLECFRAC_NONEQM) || defined(EXTERNAL_CHEMISTRY_REPORTS_H2)
     MyFloat MolecularMassFraction;              /*!< holder for molecular mass fraction for sims where we evaluate it on-the-fly and wish to save it [different from detailed chemistry modules] */
 #if defined(COOL_MOLECFRAC_NONEQM)
     MyFloat MolecularMassFraction_perNeutralH;  /*! molecular mass fraction -of-the-neutral-gas-, which we retain as a separate variable since we have a hybrid model here using implicit updates for the ionization fraction */
@@ -329,6 +338,10 @@ extern struct gas_cell_data
     MyFloat Eta_MHD_OhmicResistivity_Coeff;     /*!< Ohmic resistivity coefficient [physical units of L^2/t] */
     MyFloat Eta_MHD_HallEffect_Coeff;           /*!< Hall effect coefficient [physical units of L^2/t] */
     MyFloat Eta_MHD_AmbiPolarDiffusion_Coeff;   /*!< Hall effect coefficient [physical units of L^2/t] */
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+    Vec3<MyFloat> NonIdealMHDFlux;              /*!< non-ideal MHD electric field times c [explicitly evolved; physical units of B*L/t; dB/dt = -curl of this] */
+    Vec3<MyFloat> NonIdealMHDFluxPred;          /*!< drift-predicted value of NonIdealMHDFlux */
+#endif
 #endif
 
 #ifdef MHD_BATTERY_MECHANISMS
@@ -403,7 +416,7 @@ extern struct gas_cell_data
 #endif
 #endif
 #ifdef RT_CHEM_PHOTOION
-#if !defined(COOLING) || defined(CHIMES)
+#if !defined(COOLING)
     MyFloat HI;                  /* HI fraction [declared above with Ne when the cooling module owns it] */
 #endif
     MyFloat HII;                 /* HII fraction */
@@ -478,11 +491,12 @@ extern struct gas_cell_data
     Mat3<MyDouble> Elastic_Stress_Tensor; /* deviatoric stress tensor */
     Mat3<MyDouble> Elastic_Stress_Tensor_Pred;
     Mat3<MyDouble> Dt_Elastic_Stress_Tensor;
+    MyFloat RecentYieldMemory;            /* recent plastic flow: the overstress removed by the yield returns, in units of the yield strength, decaying over ten sound-crossing times of the kernel radius; switches the tensile-instability correction off in material that is flowing plastically (not an accumulated plastic strain) */
 #endif
 #ifdef EOS_DAMAGE_POROSITY
-    MyFloat Damage;        /* Grady-Kipp scalar damage D in [0,1] */
+    MyFloat Damage;        /* scalar fracture damage D in [0,1] */
     MyFloat Distention;    /* Jutzi P-alpha distention alpha in [1, alpha_0] */
-    MyFloat ActiveCracks;  /* Grady-Kipp Weibull active-flaw bookkeeping */
+    MyFloat ActiveCracks;  /* fracture bookkeeping: number of activated flaws (tensile-flaw law) or the crack radius (shear-activated law), per the material's FractureActivation */
 #endif
 #endif
     
@@ -579,6 +593,22 @@ extern struct gas_cell_data
     GIZMO_GPU_FUNCTION inline double gas_temperature_from_u(double u) const {
         return (Gamma - 1.) * MeanMolecularWeight * U_TO_TEMP_UNITS * u;
     }
+#if defined(COOLING) && defined(EXTERNAL_CHEMISTRY_REPORTS_SPECIES)
+    /*!< the one way a chemistry library hands what it solved to the rest of the code. Everything else reads these back from
+         the cell and never from the library, so the library's own storage can stay on the host. The fractions are per
+         hydrogen nucleus and the molecular one is the fraction of the hydrogen mass in H2. The mean molecular weight and
+         adiabatic index are those of the state at specific energy u, and the temperature follows from them by the relation
+         above, so gas_temperature_from_u() reads the three back as a set. */
+    GIZMO_GPU_FUNCTION inline void store_solved_chemistry(double u, double mean_molecular_weight, double gamma,
+                                                          double electrons, double neutral_hydrogen, double ionized_hydrogen, double molecular_mass_fraction)
+    {
+        MeanMolecularWeight = mean_molecular_weight; Gamma = gamma; Temperature = gas_temperature_from_u(u);
+        Ne = electrons; HI = neutral_hydrogen; HII = ionized_hydrogen;
+#if defined(EXTERNAL_CHEMISTRY_REPORTS_H2)
+        MolecularMassFraction = molecular_mass_fraction;
+#endif
+    }
+#endif
 
     /*!< the temperature of THIS cell at energy u, which is what callers almost always want. Where the
          cached pair is anchored this measures from it, so the result is exact at the anchor and correct
@@ -604,7 +634,9 @@ extern struct gas_cell_data
 #endif
 
     GIZMO_GPU_FUNCTION double gamma_eos_value() const { /*!< effective adiabatic index */
-#if defined(COOL_MOLECFRAC_NONEQM)
+#if defined(EOS_CHEMISTRY_PROVIDES_GAMMA)
+        return Gamma; /* as the chemistry stored it for the state it solved */
+#elif defined(COOL_MOLECFRAC_NONEQM)
         double fH = HYDROGEN_MASSFRAC, f = MolecularMassFraction, xe = Ne;
         double f_mono = fH*(xe + 1.-f) + (1.-fH)/4., f_di = fH*f/2., gamma_mono=5./3., gamma_di=7./5.;
 #ifdef EOS_SUBSTELLAR_ISM
@@ -710,20 +742,13 @@ extern struct gas_cell_data
     }
 
 #ifdef EOS_TILLOTSON
-    GIZMO_GPU_FUNCTION double calculate_tillotson_eos() { /*!< Tillotson EOS: sets SoundSpeed, returns pressure */
+    GIZMO_GPU_FUNCTION double tillotson_matrix_pressure(double rho, double u, double *cs2_out) const { /*!< Tillotson pressure and squared sound speed at density rho */
         int type = CompositionType;
         double a=All.Tillotson_EOS_params[type][0], b=All.Tillotson_EOS_params[type][1],
         u0=All.Tillotson_EOS_params[type][2], rho0=All.Tillotson_EOS_params[type][3],
         A0=All.Tillotson_EOS_params[type][4], B0=All.Tillotson_EOS_params[type][5],
         u_s=All.Tillotson_EOS_params[type][6], u_s_prime=All.Tillotson_EOS_params[type][7],
         alpha=All.Tillotson_EOS_params[type][8], beta=All.Tillotson_EOS_params[type][9];
-        double rho=Density, u=InternalEnergyPred;
-#if defined(EOS_DAMAGE_POROSITY) && ((EOS_DAMAGE_POROSITY) & 4)
-        /* P-alpha porosity. Tillotson is evaluated at the matrix
-         * density rho_s = alpha*rho_bulk; bulk pressure is P_matrix/alpha. */
-        double alpha_d = (Distention >= 1.0) ? Distention : 1.0;
-        rho *= alpha_d;
-#endif
         double eta=rho/rho0, mu=eta-1, u_u0eta2=1+u/(u0*eta*eta), p0=u*rho, z=1/eta-1, press=0, cs=0, press_min=1.e-10*u0*rho0;
         double Pc = (a + b/u_u0eta2)*p0 + A0*mu + B0*mu*mu;
         double c2c_rho = (1+a+b/u_u0eta2)*Pc + A0+B0*(eta*eta-1) + b*(u_u0eta2-1)*(2*p0-Pc)/(u_u0eta2*u_u0eta2);
@@ -734,26 +759,65 @@ extern struct gas_cell_data
         double c2x_rho = (c2c_rho*(u-u_s) + c2e_rho*(u_s_prime - u)) / (u_s_prime - u_s);
         if(u <= u_s) {press=Pc; cs=c2c_rho;} else {if(u >= u_s_prime) {press=Pe; cs=c2e_rho;} else {press=Px; cs=c2x_rho;}}
         if(cs <= 0) {cs=press_min;}
-        SoundSpeed = cs/rho;
+        *cs2_out = cs/rho;
+        return press;
+    }
+    GIZMO_GPU_FUNCTION double calculate_tillotson_eos() { /*!< Tillotson EOS: sets SoundSpeed, returns pressure */
+        double rho=Density, u=InternalEnergyPred, cs2=0, press=0;
+#if defined(EOS_DAMAGE_POROSITY) && ((EOS_DAMAGE_POROSITY) & 4)
+        /* P-alpha porosity: Tillotson is evaluated at the matrix density rho_s = alpha*rho_bulk and the bulk pressure is P_matrix/alpha.
+           Compaction is irreversible and self-consistent: alpha = min(alpha_prev, crush(P_matrix(alpha*rho))). The crush curve falls as the
+           matrix pressure rises, so the root is unique wherever that rises with density. Whenever the previous distention would compact, the
+           root of f(alpha) = alpha - crush(P_matrix(alpha*rho)) is found between 1 (f <= 0) and alpha_prev (f > 0) by the Illinois (modified
+           regula falsi) method, which stays inside that bracket and typically needs 3-4 pressure evaluations at a relative tolerance of 1e-12
+           (taking alpha from the pressure at the uncompacted state overshoots, and the matrix then reads tension in material that was
+           compressed). The sound speed keeps its acoustic part at the matrix density and its elastic (shear) part at the bulk density, on
+           which the stress acts. */
+        {
+            double alpha_0_p = solid_material_of(CompositionType).InitialDistention;
+            double P_e_p     = solid_material_of(CompositionType).CrushPressureElastic;
+            double P_s_p     = solid_material_of(CompositionType).CrushPressureSolid;
+            double alpha_prev = (Distention >= 1.0) ? Distention : 1.0, alpha_new = alpha_prev;
+            press = tillotson_matrix_pressure(alpha_prev*rho, u, &cs2);
+            double f_hi = alpha_prev - jutzi_distention_eq8(press, alpha_0_p, P_e_p, P_s_p);
+            if(f_hi > 0) {
+                double press_prev = press, cs2_prev = cs2; /* the state at alpha_prev, kept if the solve meets a non-finite pressure */
+                double a_lo = 1.0, a_hi = alpha_prev, cs2_try = 0;
+                double press_try = tillotson_matrix_pressure(rho, u, &cs2_try), f_lo = 1.0 - jutzi_distention_eq8(press_try, alpha_0_p, P_e_p, P_s_p);
+                alpha_new = 1.0; press = press_try; cs2 = cs2_try; /* f_lo = 0: the matrix pressure at full compaction is above P_s */
+                volatile int last_side = 0, converged = (f_lo >= 0), failed = !(f_lo == f_lo); /* last_side: which end the previous estimate replaced, +1 upper, -1 lower */
+                for(int it = 0; it < 60 && !converged && !failed; it++) {
+                    double a_try = (a_lo*f_hi - a_hi*f_lo) / (f_hi - f_lo);
+                    press_try = tillotson_matrix_pressure(a_try*rho, u, &cs2_try);
+                    double f_try = a_try - jutzi_distention_eq8(press_try, alpha_0_p, P_e_p, P_s_p);
+                    if(!(f_try == f_try)) {failed = 1; break;}
+                    alpha_new = a_try; press = press_try; cs2 = cs2_try;
+                    if(f_try > 0) {a_hi = a_try; f_hi = f_try; if(last_side == 1) {f_lo *= 0.5;} last_side = 1;}
+                    else {a_lo = a_try; f_lo = f_try; if(last_side == -1) {f_hi *= 0.5;} last_side = -1;}
+                    if(a_hi - a_lo < 1.e-12 * a_hi || fabs(f_try) < 1.e-12 * a_try) {converged = 1;}
+                }
+                for(int it = 0; it < 200 && !converged && !failed; it++) { /* not converged in 60 Illinois steps: bisect what remains of the bracket (~40 halvings reach the tolerance) */
+                    double a_mid = 0.5*(a_lo + a_hi);
+                    press_try = tillotson_matrix_pressure(a_mid*rho, u, &cs2_try);
+                    double f_mid = a_mid - jutzi_distention_eq8(press_try, alpha_0_p, P_e_p, P_s_p);
+                    if(!(f_mid == f_mid)) {failed = 1; break;}
+                    alpha_new = a_mid; press = press_try; cs2 = cs2_try;
+                    if(f_mid > 0) {a_hi = a_mid;} else {a_lo = a_mid;}
+                    if(a_hi - a_lo < 1.e-12 * a_hi || f_mid == 0) {converged = 1;}
+                }
+                if(failed || !converged) {alpha_new = alpha_prev; press = press_prev; cs2 = cs2_prev;} /* a non-finite pressure inside the bracket: no compaction this step, as before this solve existed */
+            }
+            Distention = alpha_new;
+            if(alpha_new > 1.0) {press /= alpha_new;}
+        }
+#else
+        press = tillotson_matrix_pressure(rho, u, &cs2);
+#endif
+        SoundSpeed = cs2;
 #ifdef EOS_ELASTIC
-        SoundSpeed += All.Tillotson_EOS_params[CompositionType][10] / rho;
+        SoundSpeed += elastic_longitudinal_soundspeed2_excess(CompositionType, Density); /* the stress acts on the bulk density, porous or not */
 #endif
         SoundSpeed = sqrt(SoundSpeed);
-#if defined(EOS_DAMAGE_POROSITY) && ((EOS_DAMAGE_POROSITY) & 4)
-        /* irreversibly update distention from current matrix
-         * pressure, then convert matrix pressure to bulk porous pressure.
-         * Sound speed retained as matrix-frame value (CFL-conservative). */
-        {
-            double alpha_0_p = All.Tillotson_EOS_params[CompositionType][15];
-            double P_e_p     = All.Tillotson_EOS_params[CompositionType][16];
-            double P_s_p     = All.Tillotson_EOS_params[CompositionType][17];
-            double alpha_eq = jutzi_distention_eq8(press, alpha_0_p, P_e_p, P_s_p);
-            double alpha_new = (alpha_eq < Distention) ? alpha_eq : Distention;
-            if(alpha_new < 1.0) { alpha_new = 1.0; }
-            Distention = alpha_new;
-            if(alpha_new > 1.0) { press /= alpha_new; }
-        }
-#endif
         return press;
     }
 #endif

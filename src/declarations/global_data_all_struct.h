@@ -21,12 +21,18 @@
 #endif
 #endif
 
+#ifndef GIZMO_config_H
 #include "../GIZMO_config.h"
+#endif
 #include "precompiler_logic.h"
 #include "constants.h"
 #include "macros.h"
 #include "typedefs.h"
+#include "../eos/composition_registry.h"
 #include "../math_types/vec3.h"
+#if defined(COOLING) && defined(COOL_GRACKLE)
+#include <grackle.h> /* for the code_units member below; this header is also reached without allvars.h */
+#endif
 
 /*! This structure contains data which is the SAME for all tasks (mostly code parameters read from the
  * parameter file).  Holding this data in a structure is convenient for writing/reading the restart file, and
@@ -130,6 +136,7 @@ struct global_data_all_processes
 #endif
 #ifdef CHIMES
   int ChimesThermEvolOn;        /*!< Flag to determine whether to evolve the temperature in CHIMES. */
+  int ChimesNumSpecies;         /*!< Number of CHIMES species tracked in each cell: the value of ChimesGlobalVars.totalNumberOfSpecies, which sits in host memory, for code that runs on the device. */
 #ifdef CHIMES_STELLAR_FLUXES
   double Chimes_f_esc_ion;
   double Chimes_f_esc_G0;
@@ -241,8 +248,14 @@ struct global_data_all_processes
   int NeighborLoopModeBThresholdSum;	/*!< optional Mode-A/B dispatch threshold on the summed active-neighbor count; -1 = unset (each loop's built-in default) */
   int NeighborLoopModeBThresholdMax;	/*!< optional Mode-A/B dispatch threshold on the max-rank active-neighbor count; -1 = unset (each loop's built-in default) */
   int NeighborLoopModeDThresholdSum;	/*!< optional lower bound on the summed active count for Mode D on the calls Mode B does not take; -1 = unset (= 0) */
-  int NeighborLoopModeDThresholdMax;	/*!< optional lower bound on the max-rank active count for Mode D on the calls Mode B does not take; -1 = unset (= 0) */
-  int GravityHostWalkBelowActive;	/*!< below this many RANK-LOCAL active gravity candidates the gravity tree walk runs on the host instead of the device. 0 disables the count-based routing. Default 1000. */
+  int NeighborLoopModeDThresholdMax;	/*!< optional lower bound on the max-rank active count for Mode D on the calls Mode B does not take; -1 = unset (= the built-in 100000) */
+  int GPUElementOffloadMinCount;	/*!< per-MPI-task count of elements from which a per-particle loop runs on the device; sets the defaults of the particle-loop and drift counts below. -1 = unset (4096) */
+  int GPUTreeOffloadMinCount;	/*!< per-MPI-task count of tree-walk sources from which the walk runs on the device; sets the defaults of the tree-walk, gravity-walk and spatial-index counts. -1 = unset (4096) */
+  int GPUParticleLoopOffloadMinCount;	/*!< own count for the per-particle loops (cooling, nuclear network, turbulence driving, RT chemistry, grain drag, CBE integrator). -1 = unset (GPUElementOffloadMinCount), 0 = the device whenever there is any work */
+  int GPUDriftOffloadMinCount;	/*!< own count for the particle drift. -1 = unset (a quarter of GPUElementOffloadMinCount), 0 = the device whenever there is any work */
+  int GPUTreeWalkOffloadMinCount;	/*!< own count for the sources in one batch of a neighbour-loop tree walk, which is also the fewest actives Mode D takes on its busiest rank. -1 = unset (GPUTreeOffloadMinCount), 0 = the device whenever there is any work */
+  int GravityHostWalkBelowActive;	/*!< below this many RANK-LOCAL active gravity candidates the gravity tree walk runs on the host instead of the device. 0 disables the count-based routing. -1 = unset (a quarter of GPUTreeOffloadMinCount) */
+  int HostThreadMinCount;	/*!< per-MPI-task count of items from which a host loop runs on all OpenMP threads instead of one; sets the counts of the per-particle, neighbour-loop and bookkeeping host loops. -1 = unset (max(64, 4 x OpenMP threads)), 0 = threaded whenever there is any work */
   double TreeUpdateFullSweep_ActiveFraction;	/*!< when the device runs the dynamic tree update, it drifts every node in the tree first (which also certifies the whole tree current for the walks that follow)
 					   only if the rank-local fraction of elements being updated is at least this; below it, it brings current just the chains of nodes the kick touches. 0 = always sweep every node; above 1 = chains only, with the sweep kept as the answer to a chain list that overflows. Default 2. */
   int TreeUpdateHostBelowActive;	/*!< below this many RANK-LOCAL elements due a force update at the sync point, the dynamic tree update runs on the host, which drifts nodes lazily as it
@@ -671,7 +684,16 @@ struct global_data_all_processes
 #endif
 
 #if defined(EOS_TILLOTSON) || defined(EOS_ELASTIC)
-  double Tillotson_EOS_params[7][18]; /*! < holds parameters for Tillotson EOS for solids; slots 12-15 (k_Weibull, m_Weibull, mu_DP, alpha_0) and slots 16-17 (P_e, P_s) are used only under EOS_DAMAGE_POROSITY */
+  double Tillotson_EOS_params[N_TILLOTSON_MATERIALS][10]; /*! < Tillotson EOS coefficients a, b, u_0, rho_0, A, B, u_s, u_s', alpha, beta per row (0 = custom, 1-6 presets) */
+#endif
+#ifdef EOS_ELASTIC
+  struct solid_material SolidMaterial[N_SOLID_MATERIAL_IDS]; /*!< strength/damage/porosity per CompositionType, resolved at startup: read through solid_material_of() */
+  struct solid_material SolidMaterialCustom; /*!< the custom material (CompositionType 0 of a Tillotson or plain elastic build), from the SolidMaterial_* parameters */
+#ifdef EOS_DAMAGE_POROSITY
+  double SolidMaterialFlawsPerMass[N_SOLID_MATERIAL_IDS]; /*!< tensile flaws: ln(N) N / M of each material's N elements of total mass M, set at startup (an element of mass m holds ~ m x this) */
+  double FractureOutOfPlaneExtent; /*!< 1D/2D tensile flaws: thickness (2D) or cross-sectional area (1D) that turns an element's NDIM-volume into a volume */
+  double SolidMaterialPresetFractureActivation[N_TILLOTSON_MATERIALS]; /*!< per preset row 1-6: its fracture law (SolidMaterialPreset<N>_FractureActivation; not given = tensile flaws) */
+#endif
 #endif
 
 #ifdef EOS_TABULATED
@@ -684,8 +706,15 @@ struct global_data_all_processes
 #endif
     int  AneosNumMaterials;                       /* number of ANEOS material tables to load */
     char AneosTableFiles[ANEOS_MAX_MATERIALS][256]; /* file paths for each material's SESAME table */
+#ifdef EOS_ELASTIC
+    int  AneosSolidMaterialChoice[ANEOS_MAX_MATERIALS];                   /* per table: 1-6 = preset, 0 = the table's own values (AneosTable<N>_SolidMaterial) */
+    struct solid_material AneosSolidMaterialCustom[ANEOS_MAX_MATERIALS];  /* per table custom values (AneosTable<N>_ShearModulus etc.) */
+#endif
 #endif
 
+#ifdef RANDOMIZE_GRAVTREE
+    long long RandomTreeDraws;  /*!< how many random tree offsets or frame shifts have been drawn: with the time, it names each draw, so decompositions at one time differ. Lives here so a restart resumes the same sequence. */
+#endif
 #ifdef RANDOMIZE_GRAVTREE_PERIODIC
     Vec3<double> RandomShift;   /*!< how far the coordinates presently sit from the frame the initial conditions were written in, kept in [0,box). Subtracted back out wherever a physical coordinate is reported. Lives here so a restart resumes in the frame it stopped in. */
 #endif

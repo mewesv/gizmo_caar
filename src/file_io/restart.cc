@@ -441,19 +441,18 @@ void restart(int modus)
 #endif
 	    }
 
-	  /* write state of random number generator */
-	  byten(random_generator.s, sizeof(random_generator.s), modus);
 	  byten(&SelRnd, sizeof(SelRnd), modus);
 
 #ifdef TURB_DRIVING
       byten(StRng.s, sizeof(StRng.s), modus);
 	  byten(&StNModes, sizeof(StNModes), modus);
 	  byten(StOUPhases, StNModes*6*sizeof(double),modus);
-	  byten(StAmpl, StNModes*3*sizeof(double),modus);
+	  byten(StAmpl, StNModes*sizeof(double),modus);
 	  byten(StAka, StNModes*3*sizeof(double),modus);
 	  byten(StAkb, StNModes*3*sizeof(double),modus);
 	  byten(StMode, StNModes*3*sizeof(double),modus);
 	  byten(&StTPrev, sizeof(StTPrev),modus);
+	  byten(&StTUpdatedAt, sizeof(StTUpdatedAt),modus);
 #endif
 
 	  /* write flags for active timebins */

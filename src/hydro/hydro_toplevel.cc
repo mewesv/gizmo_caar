@@ -6,6 +6,9 @@
 #include <math.h>
 #include "../declarations/allvars.h"
 #include "../core/proto.h"
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+#include "nonideal_mhd_functions.h"
+#endif
 #include "../eos/cosmic_ray_fluid/cosmic_ray_functions.h"
 #include "../mesh/kernel.h"
 #if defined(GALSF_ISMDUSTCHEM_MODEL) && defined(GALSF_ISMDUSTCHEM_GRAINSIZEEVO)
@@ -226,7 +229,10 @@ void hydro_final_operations_and_cleanup(void)
             CellP[i].DtB *= magnorm_closure;
 #endif
             CellP[i].DtInternalEnergy /= P[i].Mass;
-            /* ok, now: HydroAccel = dv/dt, DtInternalEnergy = du/dt (energy per unit mass) */
+#ifdef HYDRO_MESHLESS_FINITE_VOLUME
+            CellP[i].GravWorkTerm /= P[i].Mass;
+#endif
+            /* ok, now: HydroAccel = dv/dt, DtInternalEnergy = du/dt (energy per unit mass), GravWorkTerm.g = du/dt from mass moved through the potential */
 
             /* zero out hydrodynamic PdV work terms if the particle is at the maximum smoothing, these will be incorrect */
             if(P[i].KernelRadius >= 0.99*All.MaxKernelRadius) {CellP[i].DtInternalEnergy = 0;}
@@ -355,7 +361,9 @@ void hydro_final_operations_and_cleanup(void)
                 if(F_dot_B < 0) {vA_k *= -1;} // needs to have appropriately-matched signage below //
                 double gamma_0=return_CRbin_gamma_factor(target_for_cr_betagamma,k,CellP), gamma_fac=gamma_0/(gamma_0-1.); // lorentz factor here, needed in next line, because the loss term here scales with -total- energy, not kinetic energy
                 if(beta_fac<0.1) {gamma_fac=2./(beta_fac*beta_fac) -0.5 - 0.125*beta_fac*beta_fac;} // avoid accidental nan
-                Vec3<double> fcorr = bhat * (grad_P_dot_B + (gamma_fac*(F_dot_B/cosmicrayfluid_rsol_corrfac(k)) - three_chi*vA_k*(gamma_fac*e0_cr + p0_cr))*(beta_fac*beta_fac)/(3.*CellP[i].CosmicRayDiffusionCoeff[k])) / (CellP[i].Density*All.cf_a3inv); // physical units
+                double scattering_term = 0; // ~1/kappa: zero while no diffusion coefficient exists yet (with CRFLUID_EVOLVE_SCATTERINGWAVES the wave solver sets it, and it has not run before the first force evaluation), i.e. the kappa->infinity limit
+                if(CellP[i].CosmicRayDiffusionCoeff[k] > 0) {scattering_term = (gamma_fac*(F_dot_B/cosmicrayfluid_rsol_corrfac(k)) - three_chi*vA_k*(gamma_fac*e0_cr + p0_cr))*(beta_fac*beta_fac)/(3.*CellP[i].CosmicRayDiffusionCoeff[k]);}
+                Vec3<double> fcorr = bhat * (grad_P_dot_B + scattering_term) / (CellP[i].Density*All.cf_a3inv); // physical units
                 fcorr += (1.-three_chi) * (gradpcr - bhat*grad_P_dot_B) / (CellP[i].Density*All.cf_a3inv); // physical units
                 CellP[i].HydroAccel += fcorr; // add correction term back into hydro acceleration terms -- need to check that don't end up with nasty terms for badly-initialized/limited scattering rates above
             }}
@@ -414,11 +422,7 @@ void hydro_final_operations_and_cleanup(void)
 
     
 #ifdef TURB_DRIVING
-#ifdef TURB_DRIVING_UPDATE_FORCE_ON_TURBUPDATE // if this is enabled, we only update as frequently as the driving phases are recomputed, as set by TurbDrive_TimeBetweenTurbUpdates. To avoid large errors, must be set by-hand to be << lambda_min / V where V is the typical turbulent velocity and lambda_min is the smallest driven wavelength.
-    if(new_turbforce_needed_this_timestep()){add_turb_accel();}
-#else    
-    add_turb_accel(); // update turbulent driving fields and TurbAccel fields at same time as update HydroAccel, here
-#endif    
+    add_turb_accel(); // update turbulent driving fields and TurbAccel fields at same time as update HydroAccel, here. With TURB_DRIVING_UPDATE_FORCE_ON_TURBUPDATE a cell's TurbAccel is only recomputed after the driving phases change, as set by TurbDrive_TimeBetweenTurbUpdates; to avoid large errors that must be set by-hand to be << lambda_min / V where V is the typical turbulent velocity and lambda_min is the smallest driven wavelength.
 #endif
 
 }
@@ -447,6 +451,17 @@ void hydro_force_initial_operations_preloop(void)
         if(P[i].Type==0)
         {
             CellP[i].MaxSignalVel = MIN_REAL_NUMBER;
+#ifdef MHD_NON_IDEAL_EVOLVED_FLUX
+            {   /* the face fluxes must see the evolved non-ideal field relaxed toward the current from THIS step's gradients, as the
+                   standard solver uses them: the drift predicted it with the previous step's gradients, which lags the non-ideal
+                   EMF one step behind the ideal one. Re-predict it from the kicked value over the second half-step with the fresh
+                   gradients -- the same update the second half-step kick then applies to the kicked value. */
+                integertime ti_step = P[i].integertime_step();
+                double dt_second_half = (ti_step - ti_step/2) * unit_integertime_in_physical(i, P);
+                CellP[i].NonIdealMHDFluxPred = CellP[i].NonIdealMHDFlux;
+                nonideal_mhd_flux_update_driftkick(i, dt_second_half, 1, P, CellP);
+            }
+#endif
 #ifdef OUTPUT_SHOCK_MACH_NUMBER
             CellP[i].ShockMachNumber = 0;
 #endif
@@ -460,6 +475,9 @@ void hydro_force_initial_operations_preloop(void)
             CellP[i].HydroAccel = {};
 #ifdef HYDRO_MESHLESS_FINITE_VOLUME
             CellP[i].DtMass = 0; CellP[i].dMass = 0; CellP[i].GravWorkTerm = {};
+#endif
+#if defined(EOS_ELASTIC) && defined(EOS_TYPES_DEFAULTGAS_AND_SOLIDS)
+            CellP[i].ElasticImpedanceNeighbour = 0; /* set again by this force evaluation; an inactive cell keeps its value */
 #endif
 #if defined(TURB_DIFF_METALS) || (defined(METALS) && defined(HYDRO_MESHLESS_FINITE_VOLUME))
             for(k=0;k<NUM_METAL_SPECIES;k++) {CellP[i].Dyield[k] = 0;}
