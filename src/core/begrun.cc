@@ -1369,6 +1369,32 @@ void gizmo_gpu_offload_report(void)
     fflush(stdout);
 }
 
+/* Parameter files are often pasted from editors that insert Unicode spaces.
+ * sscanf's byte-oriented whitespace handling does not recognize UTF-8 spaces
+ * reliably. Fold Unicode White_Space characters to ASCII spaces before scanning.
+ * Compact in place; leave all other bytes (including non-ASCII paths) unchanged.
+ * Each continuation-byte read is guarded by its preceding byte, so an incomplete
+ * UTF-8 sequence at the end of a line is left untouched. */
+static void normalize_parameter_whitespace(char *line)
+{
+    unsigned char *src = reinterpret_cast<unsigned char *>(line);
+    unsigned char *dst = src;
+    while(*src)
+    {
+        int width = 0;
+        if(src[0] == 0xc2 && (src[1] == 0x85 || src[1] == 0xa0)) {width = 2;}
+        else if(src[0] == 0xe1 && src[1] == 0x9a && src[2] == 0x80) {width = 3;}
+        else if(src[0] == 0xe2 && src[1] == 0x80 &&
+                ((src[2] >= 0x80 && src[2] <= 0x8a) || src[2] == 0xa8 ||
+                 src[2] == 0xa9 || src[2] == 0xaf)) {width = 3;}
+        else if(src[0] == 0xe2 && src[1] == 0x81 && src[2] == 0x9f) {width = 3;}
+        else if(src[0] == 0xe3 && src[1] == 0x80 && src[2] == 0x80) {width = 3;}
+        if(width) {*dst++ = ' '; src += width;}
+        else {*dst++ = *src++;}
+    }
+    *dst = 0;
+}
+
 /*! This function parses the parameterfile in a simple way.  Each paramater is
  *  defined by a keyword (`tag'), and can be either of type douple, int, or
  *  character string.  The routine makes sure that each parameter appears
@@ -2949,6 +2975,7 @@ void read_parameter_file(char *fname)
                     *buf = 0;
                     if(fgets(buf, sizeof(buf), fd) == NULL) {break;}   /* EOF, or a read error feof() will not report */
                     int line_was_truncated = (strlen(buf) == sizeof(buf) - 1 && buf[sizeof(buf) - 2] != '\n' && !feof(fd));   /* !feof distinguishes a cut line from a final line that merely ends without a newline */
+                    normalize_parameter_whitespace(buf);
                     if(sscanf(buf, "%s%s%s", buf1, buf2, buf3) < 2)
                         continue;
 
